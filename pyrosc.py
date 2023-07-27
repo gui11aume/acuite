@@ -44,8 +44,8 @@ def model(data, generate=False):
          name = "s",
          # dim: (P) x 1 x 1 | .
          fn = dist.LogNormal(
-            2. * torch.ones(1,1).to(device, torch.float64),
-            2. * torch.ones(1,1).to(device, torch.float64)
+            2. * torch.ones(1,1).to(device),
+            2. * torch.ones(1,1).to(device)
          )
    )
 
@@ -56,8 +56,8 @@ def model(data, generate=False):
          # dim: (P) x 1 x 1 | .
          name = "pi",
          fn = dist.Beta(
-            1. * torch.ones(1,1).to(device, torch.float64),
-            4. * torch.ones(1,1).to(device, torch.float64)
+            1. * torch.ones(1,1).to(device),
+            4. * torch.ones(1,1).to(device)
          )
    )
 
@@ -76,8 +76,8 @@ def model(data, generate=False):
                name = "alpha",
                # dim(alpha): (P x 1) x K
                fn = dist.Gamma(
-                  torch.ones(1).to(device, torch.float64) / K,
-                  torch.ones(1).to(device, torch.float64)
+                  torch.ones(1).to(device) / K,
+                  torch.ones(1).to(device)
                )
          )
 
@@ -111,8 +111,8 @@ def model(data, generate=False):
       B_block = (.02 * torch.ones(B,B))
       B_block.fill_diagonal_(.03)
 
-      cor_CB = .97 + torch.block_diag(*([B_block]*C)).to(device, torch.float64)
-      mu_CB = torch.ones(1,C*B).to(device, torch.float64)
+      cor_CB = .97 + torch.block_diag(*([B_block]*C)).to(device)
+      mu_CB = torch.ones(1,C*B).to(device)
 
       base = pyro.sample(
             name = "base",
@@ -133,8 +133,8 @@ def model(data, generate=False):
                name = "modules",
                # dim(modules): (P) x K*L x G
                fn = dist.Normal(
-                  0.00 * torch.zeros(1,1,1).to(device, torch.float64),
-                  0.25 * torch.ones(1,1,1).to(device, torch.float64)
+                  0.00 * torch.zeros(1,1,1).to(device),
+                  0.25 * torch.ones(1,1,1).to(device)
                )
          )
 
@@ -169,8 +169,8 @@ def model(data, generate=False):
             name = "shift",
             # dim(shift): (P) x ncells x 1 | .
             fn = dist.Normal(
-               0. * torch.zeros(1,1).to(device, torch.float64),
-               1. * torch.ones(1,1).to(device, torch.float64)
+               0. * torch.zeros(1,1).to(device),
+               1. * torch.ones(1,1).to(device)
             )
       )
 
@@ -185,7 +185,7 @@ def model(data, generate=False):
             # dim: L x 1  x ncells x 1 if impute_labels is True
             # dim:    (P) x ncells x 1 if impute_labels is False
             fn = dist.Categorical(
-                torch.ones(1,1,L).to(device, torch.float64),
+                torch.ones(1,1,L).to(device),
             ),
             obs = label.view(-1,1) if label is not None else None,
             obs_mask = label_mask.view(-1,1) if impute_labels else None
@@ -274,11 +274,11 @@ def guide(data=None, generate=False):
    # Posterior distribution of 's'.
    post_s_loc = pyro.param(
          "post_s_loc", # dim: 1
-         lambda: 2 * torch.ones(1).to(device, torch.float64)
+         lambda: 2 * torch.ones(1).to(device)
    )
    post_s_scale = pyro.param(
          "post_s_scale", # dim: 1
-         lambda: 2 * torch.ones(1).to(device, torch.float64),
+         lambda: 2 * torch.ones(1).to(device),
          constraint = torch.distributions.constraints.positive
    )
 
@@ -294,12 +294,12 @@ def guide(data=None, generate=False):
    # Posterior distribution of 'pi'.
    post_pi_0 = pyro.param(
          "post_pi_0", # dim: 1
-         lambda: 1. * torch.ones(1).to(device, torch.float64),
+         lambda: 1. * torch.ones(1).to(device),
          constraint = torch.distributions.constraints.positive
    )
    post_pi_1 = pyro.param(
          "post_pi_1", # dim: 1
-         lambda: 4. * torch.ones(1).to(device, torch.float64),
+         lambda: 4. * torch.ones(1).to(device),
          constraint = torch.distributions.constraints.positive
    )
 
@@ -318,7 +318,7 @@ def guide(data=None, generate=False):
    
          post_alpha_param = pyro.param(
                "post_alpha_param", # dim: K
-               lambda: torch.ones(K).to(device, torch.float64) / K,
+               lambda: torch.ones(K).to(device) / K,
                constraint = torch.distributions.constraints.positive
          )
    
@@ -327,7 +327,7 @@ def guide(data=None, generate=False):
                # dim(alpha): (P x 1) x K | .
                fn = dist.Gamma(
                   post_alpha_param, # dim: K
-                  torch.ones(1).to(device, torch.float64)
+                  torch.ones(1).to(device)
                )
          )
 
@@ -337,11 +337,11 @@ def guide(data=None, generate=False):
       # Posterior distribution of 'base'.
       post_base_loc = pyro.param(
             "post_base_loc", # dim: G x C*B
-            lambda: 1 * torch.ones(G,C*B).to(device, torch.float64)
+            lambda: 1 * torch.ones(G,C*B).to(device)
       )
       post_base_scale = pyro.param(
             "post_base_scale", # dim: G x 1
-            lambda: 3 * torch.ones(G,1).to(device, torch.float64),
+            lambda: 3 * torch.ones(G,1).to(device),
             constraint = torch.distributions.constraints.positive
       )
 
@@ -360,11 +360,11 @@ def guide(data=None, generate=False):
          # Posterior distribution of 'mod'.
          post_mod_loc = pyro.param(
                "post_mod_loc", # dim: KL x G
-               lambda: 0 * torch.zeros(K*L,G).to(device, torch.float64)
+               lambda: 0 * torch.zeros(K*L,G).to(device)
          )
          post_mod_scale = pyro.param(
                "post_mod_scale", # dim: 1 x G
-               lambda: .25 * torch.ones(1,G).to(device, torch.float64),
+               lambda: .25 * torch.ones(1,G).to(device),
                constraint = torch.distributions.constraints.positive
          )
 
@@ -384,7 +384,7 @@ def guide(data=None, generate=False):
          # Posterior distribution of 'theta'.
          post_theta_param = pyro.param(
                "post_theta_param",
-               lambda: torch.ones(ncells,1,K).to(device, torch.float64),
+               lambda: torch.ones(ncells,1,K).to(device),
                constraint = torch.distributions.constraints.greater_than(0.5)
          )
          post_theta = pyro.sample(
@@ -398,11 +398,11 @@ def guide(data=None, generate=False):
       # Posterior distribution of 'shift'.
       post_shift_loc = pyro.param(
             "post_shift_loc",
-            lambda: 0 * torch.zeros(ncells,1).to(device, torch.float64),
+            lambda: 0 * torch.zeros(ncells,1).to(device),
       )
       post_shift_scale = pyro.param(
             "post_shift_scale",
-            lambda: 1 * torch.ones(ncells,1).to(device, torch.float64),
+            lambda: 1 * torch.ones(ncells,1).to(device),
             constraint = torch.distributions.constraints.positive
       )
       post_shift = pyro.sample(
@@ -417,7 +417,7 @@ def guide(data=None, generate=False):
       # Posterior distribution of unobserved labels.
       post_label_param = pyro.param(
             "post_label_param", # dim: ncells x 1 x L
-            lambda: 1. * torch.ones(ncells,1,L).to(device, torch.float64),
+            lambda: 1. * torch.ones(ncells,1,L).to(device),
             constraint = torch.distributions.constraints.simplex
       )
       with pyro.poutine.mask(mask=~label_mask.view(-1,1)):
@@ -451,7 +451,7 @@ if __name__ == "__main__":
    ctype = ctype.to(device)
    batche = batch.to(device)
    label = label.to(device)
-   X = X.to(device, torch.float64)
+   X = X.to(device)
 
    gene_mask = torch.ones_like(X).to(dtype=torch.bool)
    gene_mask[X.isnan()] = False
