@@ -133,8 +133,8 @@ def model(data, generate=False):
                name = "modules",
                # dim(modules): (P) x K*L x G
                fn = dist.Normal(
-                  0.00 * torch.zeros(1,1,1).to(device),
-                  0.25 * torch.ones(1,1,1).to(device)
+                  0.0 * torch.zeros(1,1,1).to(device),
+                  0.7 * torch.ones(1,1,1).to(device)
                )
          )
 
@@ -182,8 +182,8 @@ def model(data, generate=False):
 
       lab = pyro.sample(
             name = "label",
-            # dim: L x 1  x ncells x 1 if impute_labels is True
-            # dim:    (P) x ncells x 1 if impute_labels is False
+            # dim: L x (P) x ncells x 1 | . if impute_labels is True
+            # dim:     (P) x ncells x 1 | . if impute_labels is False
             fn = dist.Categorical(
                 torch.ones(1,1,L).to(device),
             ),
@@ -195,14 +195,14 @@ def model(data, generate=False):
       # dim(base_n): (P) x ncells x G
       base_n = base[...,ctype,batch].squeeze().transpose(-2,-1)
 
-      # dim(ohl):  L  x ncells x L if impute_labels is True
-      # dim(ohl): (P) x ncells x L if impute_labels is False
+      # dim(ohl): L  x (P) x ncells x L if impute_labels is True
+      # dim(ohl):      (P) x ncells x L if impute_labels is False
       ohl = F.one_hot(lab.squeeze()).to(mod.dtype)
 
       if impute_labels:
          # dim(mod_n): L x (P) x ncells x G
-         mod_n = torch.einsum("...olG,Lnl->L...nG", mod, ohl) if K == 1 else \
-                 torch.einsum("...noK,...KlG,Lnl->L...nG", theta, mod, ohl)
+         mod_n = torch.einsum("...olG,L...nl->L...nG", mod, ohl) if K == 1 else \
+                 torch.einsum("...noK,...KlG,L...nl->L...nG", theta, mod, ohl)
          
          # dim(base_n): 1 x (P) x ncells x G
          base_n = base_n.unsqueeze(0)
@@ -423,11 +423,11 @@ def guide(data=None, generate=False):
       with pyro.poutine.mask(mask=~label_mask.view(-1,1)):
          post_lab_unobserved = pyro.sample(
                name = "label_unobserved",
-               # dim: 1 x ncells | L
+               # dim: L x (P) x ncells x 1 | .
                fn = dist.Categorical(
                    post_label_param,
                ),
-               infer = { "enumerate": "parallel" }
+               infer = { "enumerate": "parallel", "expand": True }
          )
 
 
