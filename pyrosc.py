@@ -24,17 +24,26 @@ DEBUG = False
 pyro.enable_validation(DEBUG)
 
 
+def subset(tensor, idx):
+   if tensor is None: return None
+   return tensor.index_select(0, idx.to(tensor.device))
+
+
 def model(data, generate=False):
 
    batch, ctype, label, X, masks = data
    label_mask, gene_mask = masks
 
+   # Make sure labels (and masks) have proper dimension.
+   label = label.view(-1,1)
+   label_mask = label_mask.view(-1,1)
+
    if gene_mask.all(): gene_mask = None
    if label_mask.all(): label_mask = None
 
-
    device = generate.device if X is None else X.device
    ncells = X.shape[0] if X is not None else generate.shape[0]
+
 
    # Variance-to-mean ratio. Variance is modelled as
    # 's * u', where 'u' is mean gene expression and
@@ -142,7 +151,7 @@ def model(data, generate=False):
       mod = mod.view(mod.shape[:-2] + (K,L,G))
 
 
-   with pyro.plate("ncells", ncells, dim=-2):
+   with pyro.plate("ncells", ncells, dim=-2, subsample_size=256) as indx_n:
 
       # See comment above about not running latent Dirichlet
       # allocation when there is only one module.
@@ -187,22 +196,23 @@ def model(data, generate=False):
             fn = dist.Categorical(
                 torch.ones(1,1,L).to(device),
             ),
-            obs = label.view(-1,1) if label is not None else None,
-            obs_mask = label_mask.view(-1,1) if impute_labels else None
+            obs = subset(label, indx_n),
+            obs_mask = subset(label_mask, indx_n)
       )
 
-
       # dim(base_n): (P) x ncells x G
-      base_n = base[...,ctype,batch].squeeze().transpose(-2,-1)
+      c_indx = subset(ctype, indx_n)
+      b_indx = subset(batch, indx_n)
+      base_n = base[...,c_indx,b_indx].squeeze().transpose(-2,-1)
 
-      # dim(ohl): L  x (P) x ncells x L if impute_labels is True
-      # dim(ohl):      (P) x ncells x L if impute_labels is False
+      # dim(ohl):  L  x ncells x L if impute_labels is True
+      # dim(ohl): (P) x ncells x L if impute_labels is False
       ohl = F.one_hot(lab.squeeze()).to(mod.dtype)
 
       if impute_labels:
          # dim(mod_n): L x (P) x ncells x G
-         mod_n = torch.einsum("...olG,L...nl->L...nG", mod, ohl) if K == 1 else \
-                 torch.einsum("...noK,...KlG,L...nl->L...nG", theta, mod, ohl)
+         mod_n = torch.einsum("...olG,Lnl->L...nG", mod, ohl) if K == 1 else \
+                 torch.einsum("...noK,...KlG,Lnl->L...nG", theta, mod, ohl)
          
          # dim(base_n): 1 x (P) x ncells x G
          base_n = base_n.unsqueeze(0)
@@ -257,8 +267,8 @@ def model(data, generate=False):
                   probs = p,
                   gate = pi
                ),
-               obs = X,
-               obs_mask = gene_mask
+               obs = subset(X, indx_n),
+               obs_mask = subset(gene_mask, indx_n)
          )
 
    return Y
@@ -267,6 +277,13 @@ def model(data, generate=False):
 def guide(data=None, generate=False):
 
    batch, ctype, label, X, masks = data
+   label_mask, gene_mask = masks
+
+   label = label.view(-1,1)
+   label_mask = label_mask.view(-1,1)
+
+   if gene_mask.all(): gene_mask = None
+   if label_mask.all(): label_mask = None
 
    device = generate.device if X is None else X.device
    ncells = X.shape[0] if X is not None else generate.shape[0]
@@ -378,7 +395,7 @@ def guide(data=None, generate=False):
          )
 
 
-   with pyro.plate("ncells", ncells, dim=-2):
+   with pyro.plate("ncells", ncells, dim=-2, subsample_size=256) as indx_n:
 
       if K > 1:
          # Posterior distribution of 'theta'.
@@ -391,7 +408,7 @@ def guide(data=None, generate=False):
                name = "theta",
                # dim(theta): (P) x ncells x 1 | K
                fn = dist.Dirichlet(
-                  post_theta_param # dim: ncells x 1 x K
+                  subset(post_theta_param, indx_n) # dim: ncells x 1 x K
                )
          )
 
@@ -409,8 +426,8 @@ def guide(data=None, generate=False):
             name = "shift",
             # dim: (P) x ncells x 1
             fn = dist.Normal(
-               post_shift_loc,  # dim: ncells x 1
-               post_shift_scale # dim: ncells x 1
+               subset(post_shift_loc, indx_n),  # dim: ncells x 1
+               subset(post_shift_scale, indx_n) # dim: ncells x 1
             )
       )
 
@@ -420,14 +437,14 @@ def guide(data=None, generate=False):
             lambda: 1. * torch.ones(ncells,1,L).to(device),
             constraint = torch.distributions.constraints.simplex
       )
-      with pyro.poutine.mask(mask=~label_mask.view(-1,1)):
+      with pyro.poutine.mask(mask=~subset(label_mask, indx_n)):
          post_lab_unobserved = pyro.sample(
                name = "label_unobserved",
                # dim: L x (P) x ncells x 1 | .
                fn = dist.Categorical(
-                   post_label_param,
+                   subset(post_label_param, indx_n),
                ),
-               infer = { "enumerate": "parallel", "expand": True }
+               infer = { "enumerate": "parallel" }
          )
 
 
@@ -449,7 +466,7 @@ if __name__ == "__main__":
 
    # Move data to device.
    ctype = ctype.to(device)
-   batche = batch.to(device)
+   batch = batch.to(device)
    label = label.to(device)
    X = X.to(device)
 
@@ -480,6 +497,7 @@ if __name__ == "__main__":
    pyro.clear_param_store()
 
    ELBO = pyro.infer.TraceEnum_ELBO if DEBUG else pyro.infer.JitTraceEnum_ELBO
+
    svi = pyro.infer.SVI(
       model = model,
       guide = guide,
