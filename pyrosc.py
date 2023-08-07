@@ -14,35 +14,43 @@ from misc_pyrosc import (
 global K # Number of modules / set by user.
 global B # Number of batches / from data.
 global C # Number of types / from data.
-global L # Number of labels / from data.
+global R # Number of groups / from data.
 global G # Number of genes / from data.
 
 DEBUG = False
+SUBSMPL = 1024 if DEBUG else 256
 #NUM_SAMPLES = 200
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
 
 
+
+# Helper functions.
 def subset(tensor, idx):
    if tensor is None: return None
    return tensor.index_select(0, idx.to(tensor.device))
 
 
-def model(data, generate=False):
 
-   batch, ctype, label, X, masks = data
+def model(data, generate=False, train_globals=True):
+
+   ctype, batch, group, label, X, masks = data
    label_mask, gene_mask = masks
 
-   # Make sure labels (and masks) have proper dimension.
-   label = label.view(-1,1)
-   label_mask = label_mask.view(-1,1)
+   # Format observed labels for Dirichlet. Create a
+   # one-hot encoding with label smoothing.
+   ohl = F.one_hot(label, num_classes=K).to(X.dtype)
+   lab = ((.99-.01/(K-1)) * ohl + .01/(K-1)).view(-1,1,K)
 
+   # Make sure masks have proper dimension.
+   label_mask = label_mask.view(-1,1)
    if gene_mask.all(): gene_mask = None
-   if label_mask.all(): label_mask = None
 
    device = generate.device if X is None else X.device
    ncells = X.shape[0] if X is not None else generate.shape[0]
+
+   subsample_size = None if ncells < SUBSMPL else SUBSMPL
 
 
    # Variance-to-mean ratio. Variance is modelled as
@@ -73,22 +81,21 @@ def model(data, generate=False):
    # When there is only one module, there is no need to
    # compute latent Dirichlet allocation (the model is
    # degenerate and has only one case).
-   if K > 1:
-      with pyro.plate("K", K, dim=-1):
+   with pyro.plate("K", K, dim=-1):
 
-         # Weight of the transcriptional modules, showing
-         # the representation of each module in the
-         # transcriptomes of the cells. This is the same
-         # prior as in the standard latent Dirichlet
-         # allocation.
-         alpha = pyro.sample(
-               name = "alpha",
-               # dim(alpha): (P x 1) x K
-               fn = dist.Gamma(
-                  torch.ones(1).to(device) / K,
-                  torch.ones(1).to(device)
-               )
-         )
+      # Weight of the transcriptional modules, showing
+      # the representation of each module in the
+      # transcriptomes of the cells. This is the same
+      # prior as in the standard latent Dirichlet
+      # allocation.
+      alpha = pyro.sample(
+            name = "alpha",
+            # dim(alpha): (P x 1) x K
+            fn = dist.Gamma(
+               torch.ones(1).to(device) / K,
+               torch.ones(1).to(device)
+            )
+      )
 
 
    # Per-gene sampling.
@@ -128,7 +135,7 @@ def model(data, generate=False):
             # dim(base): (P x 1) x G | C*B
             fn = dist.MultivariateNormal(
                1 * mu_CB, # dim:   1 x C*B 
-               3 * cor_CB # dim: C*B x C*B
+               4 * cor_CB # dim: C*B x C*B
             )
       )
 
@@ -136,68 +143,62 @@ def model(data, generate=False):
       base = base.view(base.shape[:-1] + (C,B))
 
 
-      with pyro.plate("KLxG", K*L, dim=-2):
+      with pyro.plate("KRxG", K*R, dim=-2):
 
+         mix = torch.distributions.Categorical(
+               torch.tensor([.9, .1]).to(device)
+         )
+         components = torch.distributions.Normal(
+               torch.tensor([[[.00, 0.]]]).to(device),
+               torch.tensor([[[.03, 2.]]]).to(device)
+         )
          mod = pyro.sample(
                name = "modules",
-               # dim(modules): (P) x K*L x G
-               fn = dist.Normal(
-                  0.0 * torch.zeros(1,1,1).to(device),
-                  0.7 * torch.ones(1,1,1).to(device)
-               )
+               # dim(modules): (P) x K*R x G
+               fn = dist.MixtureSameFamily(mix, components)
          )
 
-      # dim(mod): (P) x K x L x G
-      mod = mod.view(mod.shape[:-2] + (K,L,G))
+#         mod = pyro.sample(
+#               name = "modules",
+#               # dim(modules): (P) x K*R x G
+#               fn = dist.Normal(
+#                  .0 * torch.zeros(1,1,1).to(device),
+#                  .7 * torch.ones(1,1,1).to(device)
+#               )
+#         )
+
+      # dim(mod): (P) x K x R x G
+      mod = mod.view(mod.shape[:-2] + (K,R,G))
 
 
-   with pyro.plate("ncells", ncells, dim=-2, subsample_size=256) as indx_n:
+   with pyro.plate("ncells", ncells, dim=-2,
+           subsample_size=subsample_size, device=device) as indx_n:
 
-      # See comment above about not running latent Dirichlet
-      # allocation when there is only one module.
-      if K > 1:
-          # Proportion of the modules in the transcriptomes.
-          # This is the same hierarchic model as the standard
-          # latent Dirichlet allocation.
-          theta = pyro.sample(
-                name = "theta",
-                # dim(theta): (P) x ncells x 1 | K
-                fn = dist.Dirichlet(
-                   alpha.unsqueeze(-2) # dim: (P x 1) x K
-                )
-          )
+      # Proportion of the modules in the transcriptomes.
+      # This is the same hierarchic model as the standard
+      # latent Dirichlet allocation.
+      theta = pyro.sample(
+            name = "theta",
+            # dim(theta): (P) x ncells x 1 | K
+            fn = dist.Dirichlet(
+               alpha.unsqueeze(-2) # dim: (P x 1) x K
+            ),
+            obs = subset(lab, indx_n),
+            obs_mask = subset(label_mask, indx_n)
+      )
 
       # Correction for the total number of reads in the
       # transcriptome. The shift in log space corresponds
       # to a cell-specific scaling of all the genes in
       # the transcriptome. In linear space, the median
-      # is 1 by design (average 0 in log space). In
-      # linear space, the scaling factor has a 90% chance
-      # of being in the window (0.2, 5).
+      # is 1 by design (average 0 in log space).
       shift = pyro.sample(
             name = "shift",
             # dim(shift): (P) x ncells x 1 | .
-            fn = dist.Normal(
+            fn = dist.Cauchy(
                0. * torch.zeros(1,1).to(device),
                1. * torch.ones(1,1).to(device)
             )
-      )
-
-      # The dimensions of the 'lab' tensor are different
-      # if all the labels are known (deterministic) vs some
-      # of them need to be imputed (random). From here on
-      # we need to distinguish the cases for computations.
-      impute_labels = label_mask is not None
-
-      lab = pyro.sample(
-            name = "label",
-            # dim: L x (P) x ncells x 1 | . if impute_labels is True
-            # dim:     (P) x ncells x 1 | . if impute_labels is False
-            fn = dist.Categorical(
-                torch.ones(1,1,L).to(device),
-            ),
-            obs = subset(label, indx_n),
-            obs_mask = subset(label_mask, indx_n)
       )
 
       # dim(base_n): (P) x ncells x G
@@ -205,30 +206,13 @@ def model(data, generate=False):
       b_indx = subset(batch, indx_n)
       base_n = base[...,c_indx,b_indx].squeeze().transpose(-2,-1)
 
-      # dim(ohl):  L  x ncells x L if impute_labels is True
-      # dim(ohl): (P) x ncells x L if impute_labels is False
-      ohl = F.one_hot(lab.squeeze()).to(mod.dtype)
+      # dim(ohg): ncells x R
+      ohg = subset(F.one_hot(group).to(mod.dtype), indx_n)
 
-      if impute_labels:
-         # dim(mod_n): L x (P) x ncells x G
-         mod_n = torch.einsum("...olG,Lnl->L...nG", mod, ohl) if K == 1 else \
-                 torch.einsum("...noK,...KlG,Lnl->L...nG", theta, mod, ohl)
-         
-         # dim(base_n): 1 x (P) x ncells x G
-         base_n = base_n.unsqueeze(0)
+      # dim(mod_n): (P) x ncells x G
+      mod_n = torch.einsum("...noK,...KRG,nR->...nG", theta, mod, ohg)
 
-         # dim(shift): 1 x (P) x ncells x 1
-         shift = shift.unsqueeze(0)
-
-         # dim(s): 1 x (P) x 1 x 1
-         s = s.unsqueeze(0)
-      else:
-         # dim(mod_n): (P) x ncells x G
-         mod_n = torch.einsum("...oLG,...nL->...nG", mod, ohl) if K == 1 else \
-                 torch.einsum("...noK,...KLG,...nL->...nG", theta, mod, ohl)
-
-      # dim(u): L x (P) x ncells x G if impute_labels is True
-      # dim(u):     (P) x ncells x G if impute_labels is False
+      # dim(u): (P) x ncells x G
       u = torch.exp(base_n + mod_n + shift)
 
 
@@ -274,19 +258,19 @@ def model(data, generate=False):
    return Y
 
 
-def guide(data=None, generate=False):
+def guide(data=None, generate=False, train_globals=True):
 
-   batch, ctype, label, X, masks = data
+   ctype, batch, group, label, X, masks = data
    label_mask, gene_mask = masks
 
-   label = label.view(-1,1)
    label_mask = label_mask.view(-1,1)
-
    if gene_mask.all(): gene_mask = None
-   if label_mask.all(): label_mask = None
 
    device = generate.device if X is None else X.device
    ncells = X.shape[0] if X is not None else generate.shape[0]
+
+   subsample_size = None if ncells < SUBSMPL else SUBSMPL
+
 
    # Posterior distribution of 's'.
    post_s_loc = pyro.param(
@@ -298,7 +282,7 @@ def guide(data=None, generate=False):
          lambda: 2 * torch.ones(1).to(device),
          constraint = torch.distributions.constraints.positive
    )
-
+   
    post_s = pyro.sample(
          name = "s",
          # dim: (P x 1) x 1 | .
@@ -307,7 +291,7 @@ def guide(data=None, generate=False):
             post_s_scale # dim: 1
          )
    )
-
+   
    # Posterior distribution of 'pi'.
    post_pi_0 = pyro.param(
          "post_pi_0", # dim: 1
@@ -319,7 +303,7 @@ def guide(data=None, generate=False):
          lambda: 4. * torch.ones(1).to(device),
          constraint = torch.distributions.constraints.positive
    )
-
+   
    post_pi = pyro.sample(
          name = "pi",
          # dim: (P x 1) x 1 | .
@@ -328,29 +312,28 @@ def guide(data=None, generate=False):
             post_pi_1  # dim: 1
          )
    )
-
-
-   if K > 1:
-      with pyro.plate("K", K, dim=-1):
    
-         post_alpha_param = pyro.param(
-               "post_alpha_param", # dim: K
-               lambda: torch.ones(K).to(device) / K,
-               constraint = torch.distributions.constraints.positive
-         )
    
-         post_alpha = pyro.sample(
-               name = "alpha",
-               # dim(alpha): (P x 1) x K | .
-               fn = dist.Gamma(
-                  post_alpha_param, # dim: K
-                  torch.ones(1).to(device)
-               )
-         )
-
-
+   with pyro.plate("K", K, dim=-1):
+   
+      post_alpha_param = pyro.param(
+            "post_alpha_param", # dim: K
+            lambda: torch.ones(K).to(device) / K,
+            constraint = torch.distributions.constraints.positive
+      )
+   
+      post_alpha = pyro.sample(
+            name = "alpha",
+            # dim(alpha): (P x 1) x K | .
+            fn = dist.Gamma(
+               post_alpha_param, # dim: K
+               torch.ones(1).to(device)
+            )
+      )
+   
+   
    with pyro.plate("G", G, dim=-1):
-
+   
       # Posterior distribution of 'base'.
       post_base_loc = pyro.param(
             "post_base_loc", # dim: G x C*B
@@ -361,7 +344,7 @@ def guide(data=None, generate=False):
             lambda: 3 * torch.ones(G,1).to(device),
             constraint = torch.distributions.constraints.positive
       )
-
+   
       post_base = pyro.sample(
             name = "base",
             # dim: (P x 1) x G | C*B
@@ -370,42 +353,43 @@ def guide(data=None, generate=False):
                post_base_scale # dim: G x   1
             ).to_event(1)
       )
-
-
-      with pyro.plate("KLxG", K*L, dim=-2):
-
+   
+   
+      with pyro.plate("KRxG", K*R, dim=-2):
+   
          # Posterior distribution of 'mod'.
          post_mod_loc = pyro.param(
-               "post_mod_loc", # dim: KL x G
-               lambda: 0 * torch.zeros(K*L,G).to(device)
+               "post_mod_loc", # dim: KR x G
+               lambda: 0 * torch.zeros(K*R,G).to(device)
          )
          post_mod_scale = pyro.param(
                "post_mod_scale", # dim: 1 x G
                lambda: .25 * torch.ones(1,G).to(device),
                constraint = torch.distributions.constraints.positive
          )
-
+   
          post_mod = pyro.sample(
                name = "modules",
-               # dim: (P) x KL x G
+               # dim: (P) x KR x G
                fn = dist.Normal(
-                  post_mod_loc,  # dim: KL x G
+                  post_mod_loc,  # dim: KR x G
                   post_mod_scale # dim:  1 x G
                )
          )
 
 
-   with pyro.plate("ncells", ncells, dim=-2, subsample_size=256) as indx_n:
+   with pyro.plate("ncells", ncells, dim=-2,
+           subsample_size=subsample_size, device=device) as indx_n:
 
-      if K > 1:
-         # Posterior distribution of 'theta'.
-         post_theta_param = pyro.param(
-               "post_theta_param",
-               lambda: torch.ones(ncells,1,K).to(device),
-               constraint = torch.distributions.constraints.greater_than(0.5)
-         )
+      # Posterior distribution of 'theta'.
+      post_theta_param = pyro.param(
+            "post_theta_param",
+            lambda: torch.ones(ncells,1,K).to(device),
+            constraint = torch.distributions.constraints.greater_than(0.5)
+      )
+      with pyro.poutine.mask(mask=subset(~label_mask, indx_n)):
          post_theta = pyro.sample(
-               name = "theta",
+               name = "theta_unobserved",
                # dim(theta): (P) x ncells x 1 | K
                fn = dist.Dirichlet(
                   subset(post_theta_param, indx_n) # dim: ncells x 1 x K
@@ -431,21 +415,6 @@ def guide(data=None, generate=False):
             )
       )
 
-      # Posterior distribution of unobserved labels.
-      post_label_param = pyro.param(
-            "post_label_param", # dim: ncells x 1 x L
-            lambda: 1. * torch.ones(ncells,1,L).to(device),
-            constraint = torch.distributions.constraints.simplex
-      )
-      with pyro.poutine.mask(mask=~subset(label_mask, indx_n)):
-         post_lab_unobserved = pyro.sample(
-               name = "label_unobserved",
-               # dim: L x (P) x ncells x 1 | .
-               fn = dist.Categorical(
-                   subset(post_label_param, indx_n),
-               ),
-               infer = { "enumerate": "parallel" }
-         )
 
 
 if __name__ == "__main__":
@@ -454,49 +423,51 @@ if __name__ == "__main__":
    torch.manual_seed(123)
 
    K = int(sys.argv[1])
-   in_fname = sys.argv[2]
-   out_fname = sys.argv[3]
+   in_path = sys.argv[2]
+   out_path = sys.argv[3]
 
    # Optionally specify device through command line.
    device = "cuda" if len(sys.argv) == 4 else sys.argv[4]
 
 
    # Read in the data.
-   _, ctype, batch, label, X, label_mask = data = sc_data(in_fname)
+   _, ctype, batch, group, label, X, label_mask = sc_data(in_path)
 
    # Move data to device.
    ctype = ctype.to(device)
    batch = batch.to(device)
+   group = group.to(device)
    label = label.to(device)
+
    X = X.to(device)
+
+   label_mask = label_mask.to(device)
 
    gene_mask = torch.ones_like(X).to(dtype=torch.bool)
    gene_mask[X.isnan()] = False
    X[X.isnan()] = 0
 
-   label_mask = label_mask.to(device)
-
    # Set the dimensions.
    B = int(batch.max() + 1)
    C = int(ctype.max() + 1)
-   L = int(label.max() + 1)
+   R = int(group.max() + 1)
    G = int(X.shape[-1])
 
-   data = batch, ctype, label, X, (label_mask, gene_mask)
+   data = (ctype, batch, group, label, X, (label_mask, gene_mask))
 
    # Use a warmup/decay learning-rate scheduler.
    scheduler = pyro.optim.PyroLRScheduler(
          scheduler_constructor = warmup_scheduler,
          optim_args = {
             "optimizer": torch.optim.AdamW,
-            "optim_args": {"lr": 0.01}, "warmup": 300, "decay": 3000,
+            "optim_args": {"lr": 0.01}, "warmup": 200, "decay": 4000,
          },
          clip_args = {"clip_norm": 5.}
    )
 
    pyro.clear_param_store()
 
-   ELBO = pyro.infer.TraceEnum_ELBO if DEBUG else pyro.infer.JitTraceEnum_ELBO
+   ELBO = pyro.infer.Trace_ELBO if DEBUG else pyro.infer.JitTrace_ELBO
 
    svi = pyro.infer.SVI(
       model = model,
@@ -511,31 +482,16 @@ if __name__ == "__main__":
    )
 
    loss = 0.
-   for step in range(3000):
-      loss += svi.step(data)
+   for step in range(4000):
+      loss += svi.step(data, train_globals=True)
       scheduler.step()
       # Print progress on screen every 500 steps.
       if (step+1) % 500 == 0:
          sys.stderr.write(f"iter {step+1}: loss = {round(loss/1e9,3)}\n")
          loss = 0.
 
-   # Model parameters.
-   names = (
-      "post_s_loc", "post_s_scale",
-      "post_pi_0", "post_pi_1",
-      "post_base_loc", "post_base_scale",
-      "post_shift_loc", "post_shift_scale",
-      "post_label_param",
-   )
-   if K > 1:
-      names += (
-         "post_alpha_param", "post_theta_param",
-      )
-
-   ready = lambda x: x.detach().cpu().squeeze()
-   params = { name: ready(pyro.param(name)) for name in names }
-
-   torch.save({"params":params}, out_fname)
+   # Save model parameters.
+   pyro.get_param_store().save(out_path)
 
 #   # Posterior predictive sampling.
 #   predictive = pyro.infer.Predictive(
