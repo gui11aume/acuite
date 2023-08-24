@@ -5,7 +5,7 @@ import sys
 import torch
 import torch.nn.functional as F
 
-from misc_pyrosc import (
+from misc_acuite import (
       ZeroInflatedNegativeBinomial,
       warmup_scheduler,
       sc_data,

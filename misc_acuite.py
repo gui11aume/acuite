@@ -134,3 +134,21 @@ def sc_data(data_path):
       label_mask_tensor,
    )
 
+def read_sparse_matrix(data_path):
+   with open(data_path) as f:
+      ignore_header = next(f)
+      nrow, ncol, nnz = (int(x) for x in next(f).split())
+      row_indices = list()
+      col_indices = list()
+      values = list()
+      for line in f:
+         r, c, v = (int(x) for x in line.split())
+         row_indices.append(r-1)
+         col_indices.append(c-1)
+         values.append(v)
+      return torch.sparse_coo_tensor(
+         indices = [row_indices, col_indices],
+         values = values,
+         size = (nrow, ncol),
+         dtype = torch.int16
+      )   
