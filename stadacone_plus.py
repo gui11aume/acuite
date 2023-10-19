@@ -5,6 +5,13 @@ import sys
 import torch
 import torch.nn.functional as F
 
+from pyro.distributions import constraints
+from pyro.infer.autoguide import (
+      AutoDiscreteParallel,
+      AutoGuideList,
+      AutoNormal,
+)
+
 from misc_stadacone import (
       xSVI,
       ZeroInflatedNegativeBinomial,
@@ -14,18 +21,17 @@ from misc_stadacone import (
       read_sparse_matrix,
 )
 
-global K # Number of modules / set by user.
+global K # Number of units / set by user.
 global B # Number of batches / from data.
 global C # Number of types / from data.
 global R # Number of groups / from data.
 global G # Number of genes / from data.
 
-DEBUG = False
+DEBUG = True
 SUBSMPL = 256
 NUM_PARTICLES = 8
 CELL_COVERAGE = 150
 
-CORR_BETWEEN_CTYPES = 0.8
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -35,10 +41,6 @@ class Stadacone(torch.nn.Module):
 
    def __init__(self, data, inference_mode = True):
       super().__init__()
-
-      # Store parameters of the priors. Users will eventually
-      # be able to modify them.
-      self.corr_between_ctypes = CORR_BETWEEN_CTYPES
 
       # Unpack data.
       self.ctype, self.batch, self.group, self.label, self.X, masks = data
@@ -64,36 +66,26 @@ class Stadacone(torch.nn.Module):
          ignore_jit_warnings = True,
       )
 
-      # Model parts.
-      self.output_base = self.sample_base
+      # 1) Define the model.
+      self.output_scale_tril = self.sample_scale_tril
+      self.output_global_base = self.sample_global_base
       self.output_wiggle = self.sample_wiggle
+      self.output_base = self.sample_base
       self.output_batch_fx = self.sample_batch_fx
-      self.output_mod = self.sample_mod
+      self.output_units = self.sample_units
       self.output_c_indx = self.sample_c_indx
-      self.output_theta = self.sample_theta
+      self.output_theta_n = self.sample_theta_n
       self.output_shift_n = self.sample_shift_n
       self.output_base_n = self.compute_base_n_enum
       self.output_batch_fx_n = self.compute_batch_fx_n
-      self.output_mod_n = self.compute_mod_n
+      self.output_units_n = self.compute_units_n
       self.output_x_i = self.compute_ELBO_rate_n
 
-      # Guide parts.
-      self.output_post_base = self.sample_post_base
-      self.output_post_wiggle = self.sample_post_wiggle
-      self.output_post_batch_fx = self.sample_post_batch_fx
-      self.output_post_mod = self.sample_post_mod
-      self.output_post_c_indx = self.sample_post_c_indx
-      self.output_post_log_theta = self.sample_post_log_theta
-      self.output_post_shift_n = self.sample_post_shift_n
-      self.output_post_latent_x_i = self.zero
-
-      # No modules.
+      # No units.
       if K < 2:
-         self.output_mod = self.zero
-         self.output_theta = self.zero
-         self.output_mod_n = self.zero
-         self.output_post_mod = self.zero
-         self.output_post_log_theta = self.zero
+         self.output_units = self.zero
+         self.output_theta_n = self.zero
+         self.output_units_n = self.zero
 
       # All cell types known.
       if cmask.all():
@@ -106,13 +98,15 @@ class Stadacone(torch.nn.Module):
          )
          # In this case, `c_indx` is just `ctype`.
          self.output_c_indx = self.subset_c_indx
-         self.output_post_c_indx = self.zero
          self.output_base_n = self.compute_base_n_no_enum
      
-      # Generation.
       if inference_mode is False:
          self.output_x_i = self.sample_rate_n
-         self.output_post_latent_x_i = self.sample_post_rate_n
+      
+      # 2) Define the guide.
+      self.guide = AutoGuideList(self.model)
+      self.guide.append(AutoNormal(pyro.poutine.block(self.model, hide=["cell_type_unobserved"])))
+      self.guide.append(AutoDiscreteParallel(pyro.poutine.block(self.model, expose=["cell_type_unobserved"])))
 
 
    def capture_params(self):
@@ -179,148 +173,78 @@ class Stadacone(torch.nn.Module):
       return tensor.index_select(0, idx.to(tensor.device))
 
    #  ==  Model parts == #
-   def sample_base(self): 
-        
-      # Construct the matrix `cor_C` below, where
-      # c is `self.corr_between_ctypes`
-
-      #  | 1.0  c   c  ...
-      #  |  c  1.0  c  ...
-      #  |  c   c   c  ...
-
-      # Intermediate to construct the covariance matrix.
-      C_block = (self.corr_between_ctypes * torch.ones(C,C))
-      C_block.fill_diagonal_(1.0)
-      # Define parameters of the multivariate t.
-      degf_C = torch.ones(1).to(self.device)
-      mean_C = torch.zeros(1,C).to(self.device)
-      corr_C = C_block.to(self.device)
-      base = pyro.sample(
-            name = "base",
-            # dim(base): (P x 1) x G | C
-            fn = dist.MultivariateStudentT(
-               1.5 * degf_C, # dim:     1
-               0.0 * mean_C, # dim: G x C
-               1.0 * corr_C  # dim: C x C
-            )
+   def sample_scale_tril(self):
+      scale_tril = pyro.sample(
+            name = "scale_tril",
+            # dim(scale_tril): (P x 1) x 1 | C x C
+            fn = dist.LKJCholesky(
+                dim = C,
+                concentration = torch.ones(1).to(self.device)
+            ),
       )
+      return scale_tril
+
+   def sample_global_base(self): 
+      global_base = pyro.sample(
+            name = "global_base",
+            # dim(global_base): (P) x G x 1
+            fn = dist.StudentT(
+               1.5 * torch.ones(1).to(self.device),
+               0.0 * torch.zeros(1).to(self.device),
+               1.0 * torch.ones(1).to(self.device)
+            ),
+      )
+      return global_base
+
+   def sample_base(self, loc, scale_tril): 
+      base_0 = pyro.sample(
+            name = "base",
+            # dim(base_0): (P) x G x 1 | C
+            fn = dist.MultivariateNormal(
+                torch.zeros(C).to(self.device),
+                scale_tril = scale_tril
+            ),
+      )
+      # dim(base): (P) x G x C
+      base = loc + base_0.squeeze(-2)
       return base
 
-   def sample_post_base(self):
-      post_base_loc = pyro.param(
-            "post_base_loc", # dim: G x C
-            lambda: 1 * torch.ones(G,C).to(self.device)
-      )
-      post_base_scale = pyro.param(
-            "post_base_scale", # dim: G x 1
-            lambda: .3 * torch.ones(G,1).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      post_base = pyro.sample(
-            name = "base",
-            # dim: (P x 1) x G | C
-            fn = dist.Normal(
-               post_base_loc,  # dim: G x C
-               post_base_scale # dim: G x 1
-            ).to_event(1),
-      )
-      return post_base
-
    def sample_wiggle(self):
-      wiggle = pyro.sample(
-            name = "wiggle",
-            # dim(wiggle): (P x 1) x G
+      wiggle_Gx1 = pyro.sample(
+            name = "wiggle_Gx1",
+            # dim(wiggle_Gx1): (P) x G x 1
             fn = dist.LogNormal(
                 -2.0 * torch.ones(1).to(self.device),
                  1.2 * torch.ones(1).to(self.device)
             ),
       )
+      # dim(wiggle): (P) x 1 x G
+      wiggle = wiggle_Gx1.transpose(-1,-2)
       return wiggle
-
-   def sample_post_wiggle(self):
-      post_wiggle_loc = pyro.param(
-            "post_wiggle_loc", # dim: G
-            lambda: .0 * torch.ones(G).to(self.device)
-      )
-      post_wiggle_scale = pyro.param(
-            "post_wiggle_scale", # dim: G
-            lambda: .1 * torch.ones(G).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      post_wiggle = pyro.sample(
-            name = "wiggle",
-            # dim(base): (P x 1) x G
-            fn = dist.LogNormal(
-                post_wiggle_loc,
-                post_wiggle_scale
-            ),
-      )
-      return post_wiggle
 
    def sample_batch_fx(self):
       batch_fx = pyro.sample(
             name = "batch_fx",
-            # dim(base): (P) x B x G
+            # dim(base): (P) x G x B
             fn = dist.Normal(
-               .00 * torch.zeros(1,1).to(self.device), # dim: B x G
-               .05 * torch.ones(1,1).to(self.device)   # dim: B x G
-            )
+               .00 * torch.zeros(1,1).to(self.device),
+               .05 * torch.ones(1,1).to(self.device)
+            ),
       )
       return batch_fx
 
-   def sample_post_batch_fx(self):
-      post_batch_fx_loc = pyro.param(
-            "post_batch_fx_loc", # dim: B x G
-            lambda: .0 * torch.zeros(B,G).to(self.device)
-      )
-      post_batch_fx_scale = pyro.param(
-            "post_batch_fx_scale", # dim: 1 x G
-            lambda: .1 * torch.ones(1,G).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      post_batch_fx = pyro.sample(
-            name = "batch_fx",
-            # dim(base): (P) x B x G
+   def sample_units(self):
+      units_KR = pyro.sample(
+            name = "units_KR",
+            # dim(units_KR): (P) x G x KR
             fn = dist.Normal(
-               post_batch_fx_loc,
-               post_batch_fx_scale
+               .0 * torch.zeros(1,1).to(self.device),
+               .7 * torch.ones(1,1).to(self.device)
             ),
       )
-      return post_batch_fx
-
-
-   def sample_mod(self):
-      mod = pyro.sample(
-            name = "mod",
-            # dim(mod): (P) x K*R x G
-            fn = dist.Normal(
-               .0 * torch.zeros(1,1,1).to(self.device),
-               .7 * torch.ones(1,1,1).to(self.device)
-            )
-      )
-      # dim(mod): (P) x K x R x G
-      mod = mod.view(mod.shape[:-2] + (K,R,G))
-      return mod
-
-   def sample_post_mod(self):
-      post_mod_loc = pyro.param(
-            "post_mod_loc", # dim: KR x G
-            lambda: 0 * torch.zeros(K*R,G).to(self.device)
-      )
-      post_mod_scale = pyro.param(
-            "post_mod_scale", # dim: 1 x G
-            lambda: .1 * torch.ones(1,G).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      post_mod = pyro.sample(
-            name = "mod",
-            # dim: (P) x KR x G
-            fn = dist.Normal(
-               post_mod_loc,  # dim: KR x G
-               post_mod_scale # dim:  1 x G
-            ),
-      )
-      return post_mod
+      # dim(units): (P) x G x K x R
+      units = units_KR.view(units_KR.shape[:-2] + (G,K,R))
+      return units
 
    def sample_c_indx(self, ctype, cmask, indx_n):
       c_indx = pyro.sample(
@@ -329,7 +253,6 @@ class Stadacone(torch.nn.Module):
             fn = dist.Categorical(
                torch.ones(1,1,C).to(self.device),
             ),
-            infer = {"enumerate": "parallel"},
             obs = self.subset(ctype, indx_n),
             obs_mask = self.subset(cmask, indx_n)
       )
@@ -340,27 +263,27 @@ class Stadacone(torch.nn.Module):
       c_indx = self.subset(ctype, indx_n)
       return c_indx
 
-   def sample_post_c_indx(self, cmask, indx_n):
-      post_c_indx_param = pyro.param(
-            "post_c_indx_param",
-            lambda: torch.ones(self.ncells,1,C).to(self.device),
-            constraint = torch.distributions.constraints.simplex
-      )
-      with pyro.poutine.mask(mask=self.subset(~cmask, indx_n)):
-         post_c_indx = pyro.sample(
-               name = "cell_type_unobserved",
-               # dim(c_indx): C x 1 x 1 x 1 | .
-               fn = dist.Categorical(
-                  self.subset(post_c_indx_param, indx_n) # dim: ncells x 1 x C
-               ),
-               infer={"enumerate": "parallel"},
-         )
-         return post_c_indx
+#   def sample_post_c_indx(self, cmask, indx_n):
+#      post_c_indx_param = pyro.param(
+#            "post_c_indx_param",
+#            lambda: torch.ones(self.ncells,1,C).to(self.device),
+#            constraint = constraints.simplex
+#      )
+#      with pyro.poutine.mask(mask=self.subset(~cmask, indx_n)):
+#         post_c_indx = pyro.sample(
+#               name = "cell_type_unobserved",
+#               # dim(c_indx): C x 1 x 1 x 1 | .
+#               fn = dist.Categorical(
+#                  self.subset(post_c_indx_param, indx_n) # dim: ncells x 1 x C
+#               ),
+#               infer={"enumerate": "parallel"},
+#         )
+#         return post_c_indx
 
-   def sample_theta(self, lab, lmask, indx_n):
-      log_theta = pyro.sample(
-            name = "log_theta",
-            # dim(log_theta): (P) x ncells x 1 | K
+   def sample_theta_n(self, lab, lmask, indx_n):
+      log_theta_n = pyro.sample(
+            name = "log_theta_n",
+            # dim(log_theta_n): (P) x ncells x 1 | K
             fn = dist.Normal(
                torch.zeros(1,1,K).to(self.device),
                torch.ones(1,1,K).to(self.device)
@@ -368,30 +291,9 @@ class Stadacone(torch.nn.Module):
             obs = self.subset(self.smooth_lab, indx_n),
             obs_mask = self.subset(lmask, indx_n)
       ) 
-      # dim(theta): (P) x ncells x 1 x K
-      theta = log_theta.softmax(dim=-1)
-      return theta
-
-   def sample_post_log_theta(self, lmask, indx_n):
-      post_log_theta_loc = pyro.param(
-            "post_log_theta_loc",
-            lambda: torch.zeros(self.ncells,1,K).to(self.device),
-      )
-      post_log_theta_scale = pyro.param(
-            "post_log_theta_scale",
-            lambda: torch.ones(self.ncells,1,K).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      with pyro.poutine.mask(mask=self.subset(~lmask, indx_n)):
-         post_log_theta = pyro.sample(
-               name = "log_theta_unobserved",
-               # dim(theta): (P) x ncells x 1 | K
-               fn = dist.Normal(
-                  self.subset(post_log_theta_loc, indx_n),   # dim: ncells x 1 x K
-                  self.subset(post_log_theta_scale, indx_n), # dim: ncells x 1 x K
-               ).to_event(1)
-         )
-      return post_log_theta
+      # dim(theta_n): (P) x ncells x 1 x K
+      theta_n = log_theta_n.softmax(dim=-1)
+      return theta_n
 
    def sample_shift_n(self):
       shift_n = pyro.sample(
@@ -404,55 +306,35 @@ class Stadacone(torch.nn.Module):
       )
       return shift_n
 
-   def sample_post_shift_n(self, indx_n):
-      post_shift_n_loc = pyro.param(
-            "post_shift_n_loc",
-            lambda: 0 * torch.zeros(self.ncells,1).to(self.device),
-      )
-      post_shift_n_scale = pyro.param(
-            "post_shift_n_scale",
-            lambda: .1 * torch.ones(self.ncells,1).to(self.device),
-            constraint = torch.distributions.constraints.positive
-      )
-      post_shift_n = pyro.sample(
-            name = "shift_n",
-            # dim: (P) x ncells x 1
-            fn = dist.Normal(
-               self.subset(post_shift_n_loc, indx_n),  # dim: ncells x 1
-               self.subset(post_shift_n_scale, indx_n) # dim: ncells x 1
-            ),
-      )
-      return post_shift_n
-
    def compute_base_n_enum(self, c_indx, base):
-      # dim(ohc): C x ncells x C
+      # dim(ohc): ncells x C  //  C x ncells x C
       ohc = F.one_hot(c_indx.squeeze(), num_classes=C).float()
-      # dim(base_n): C x (P) x ncells x G
-      base_n = torch.einsum("Cnc,...oGc->C...nG", ohc, base)
+      # dim(ohc): z x ncells x C (z = 1 or C)
+      ohc = ohc.view((-1,) + ohc.shape[-2:])
+      # dim(base_n): z x (P) x ncells x G (z = 1 or C)
+      base_n = torch.einsum("znC,...GC->z...nG", ohc, base)
       return base_n
 
    def compute_base_n_no_enum(self, c_indx, base):
       # dim(ohc): ncells x C
       ohc = F.one_hot(c_indx.squeeze(), num_classes=C).float()
       # dim(base_n): (P) x ncells x G
-      base_n = torch.einsum("nC,...oGC->...nG", ohc, base)
+      base_n = torch.einsum("nC,...GC->...nG", ohc, base)
       return base_n
 
    def compute_batch_fx_n(self, batch, batch_fx, indx_n, dtype):
       # dim(ohg): ncells x B
       ohb = self.subset(F.one_hot(batch).to(dtype), indx_n)
       # dim(batch_fx_n): (P) x ncells x G
-      batch_fx_n = torch.einsum("...BG,nB->...nG", batch_fx, ohb)
+      batch_fx_n = torch.einsum("...GB,nB->...nG", batch_fx, ohb)
       return batch_fx_n
 
-   def compute_mod_n(self, group, theta, mod, indx_n):
+   def compute_units_n(self, group, theta_n, units, indx_n):
       # dim(ohg): ncells x R
-      ohg = self.subset(F.one_hot(group).to(mod.dtype), indx_n)
-      # dim(theta): (P) x ncells x 1 x K
-      mod_n = torch.einsum("...noK,...KRG,nR->...nG", theta, mod, ohg)
-      # dim(theta): 1 x (P) x ncells x 1 x K
-      mod_n = mod_n.unsqueeze(0)
-      return mod_n
+      ohg = self.subset(F.one_hot(group).to(units.dtype), indx_n)
+      # dim(units_n): (P) x ncells x G
+      units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
+      return units_n
 
    def compute_ELBO_rate_n(self, x_i, mu, sg, *args, **kwargs):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
@@ -512,7 +394,7 @@ class Stadacone(torch.nn.Module):
       post_rate_n_scale = pyro.param(
             "post_rate_n_scale",
             lambda: .1 * torch.ones(self.ncells,G).to(device),
-            constraint = torch.distributions.constraints.positive
+            constraint = constraints.positive
       )
       post_rate_n = pyro.sample(
             name = "rate_n",
@@ -527,47 +409,67 @@ class Stadacone(torch.nn.Module):
    #  ==  model description == #
    def model(self):
 
+      # The correlation between cell types is given by the LKJ
+      # distribution with parameter eta = 1, which is a uniform
+      # prior over  Cx C correlation matrices. The parameter
+      # `scale_tril` is not the correlation matrix but the lower
+      # Cholesky factor of the correlation matrix. It can be
+      # passed directly to `MultivariateNormal`.
+
+      scale_tril = self.output_scale_tril()
 
       # Per-gene sampling.
-      with pyro.plate("G", G, dim=-1):
+      with pyro.plate("G", G, dim=-2):
    
-         # Baselines represent the average expression per gene.
-         # The parameters have a multivariate t distribution.
-         # The distribution is centered on 0, because only the
-         # variations between genes are considered here. The
-         # parameters are correlated between cell types with 
-         # parameter `self.corr_between_ctypes`. The prior is
-         # chosen so that the parameters have a 90% chance of
-         # lying in the interval (-3.5, 3.5), i.e., there is a
-         # factor 1000 between the bottom 5% and the top 5%.
-         # The distribution has a heavy tail, the top 1% is
-         # 60,000 times higher than the average.
+         # The global baseline represents the prior average
+         # expression per gene. The parameters have a Student's t
+         # distribution. The distribution is centered on 0,
+         # because only the variations between genes are
+         # considered here. The prior is chosen so that the
+         # parameters have a 90% chance of lying in the interval
+         # (-3.5, 3.5), i.e., there is a factor 1000 between the
+         # bottom 5% and the top 5%. The distribution has a heavy
+         # tail, the top 1% is 60,000 times higher than the
+         # average.
 
-         # dim(base): (P x 1) x G | C
-         base = self.output_base()
+         # dim(base): (P) G x 1
+         global_base = self.output_global_base()
+
+         # The baselines represent the average expression per
+         # gene in each cell type. The distribution is centered
+         # on 0, because we consider the deviations from the
+         # global baseline. The prior is chosen so that the
+         # parameters have a 90% chance of lying in the interval
+         # (-3.5, 3.5), i.e., there is a factor 1000 between the
+         # bottom 5% and the top 5%. The distribution has a heavy
+         # tail, the top 1% is 60,000 times higher than the
+         # average.
+
+         # dim(base): (P) G x 1 | C
+         base = self.output_base(global_base, scale_tril)
 
          # TODO: describe prior.
 
-         # dim(base): (P x 1) x G
+         # dim(base): (P) x 1 x G
          wiggle = self.output_wiggle()
    
          # Per-batch, per-gene sampling.
-         with pyro.plate("BxG", B, dim=-2):
+         with pyro.plate("GxB", B, dim=-1):
    
             # Batch effects have a Gaussian distribution
             # centered on 0. They are weaker than 8% for
             # 95% of the genes.
 
-            # dim(base): (P) x B x G
+            # dim(base): (P) x G x B
             batch_fx = self.output_batch_fx()
    
-         # Per-module, per-type, per-gene sampling.
-         with pyro.plate("KRxG", K*R, dim=-2):
+         # Per-unit, per-type, per-gene sampling.
+         with pyro.plate("GxKR", K*R, dim=-1):
 
             # TODO: describe prior.
 
-            # dim(mod): (P) x K x R x G
-            mod = self.output_mod()
+            # dim(units): (P) x G x K x R
+            units = self.output_units()
    
    
       # Per-cell sampling (on dimension -2).
@@ -579,11 +481,11 @@ class Stadacone(torch.nn.Module):
          # dim(c_indx): C x 1 x ncells x 1 | .  /// ncells x 1
          c_indx = self.output_c_indx(self.ctype, self.cmask, indx_n)
 
-         # Proportion of the modules in the transcriptomes.
+         # Proportion of the units in the transcriptomes.
          # TODO: describe prior.
 
-         # dim(theta): (P) x ncells x 1 x K  ///  *
-         theta = self.output_theta(self.smooth_lab, self.lmask, indx_n)
+         # dim(theta_n): (P) x ncells x 1 x K  ///  *
+         theta_n = self.output_theta_n(self.smooth_lab, self.lmask, indx_n)
    
          # Correction for the total number of reads in the
          # transcriptome. The shift in log space corresponds
@@ -603,58 +505,19 @@ class Stadacone(torch.nn.Module):
          # dim(batch_fx_n): (P) x ncells x G
          batch_fx_n = self.output_batch_fx_n(batch, batch_fx, indx_n, base.dtype)
    
-         # dim(mod_n): (P) x ncells x G
-         mod_n = self.output_mod_n(group, theta, mod, indx_n)
+         # dim(units_n): (P) x ncells x G
+         units_n = self.output_units_n(group, theta_n, units, indx_n)
 
 
          # Per-cell, per-gene sampling.
          with pyro.plate("ncellsxG", G, dim=-1):
-   
-            mu = base_n + batch_fx_n + mod_n + shift_n
+
+            mu = base_n + batch_fx_n + units_n + shift_n
             x_i = self.subset(self.X, indx_n).to_dense()
             x_i_mask = self.subset(self.gmask, indx_n)
 
             self.output_x_i(x_i, mu, wiggle, x_i_mask)
 
-
-   #  ==  guide description == #
-   def guide(self):
-      
-      with pyro.plate("G", G, dim=-1):
-      
-         # Posterior distribution of `base`.
-         post_base = self.output_post_base()
-
-         # Posterior distribution of `w`.
-         post_wiggle = self.output_post_wiggle()
-
-         with pyro.plate("BxG", B, dim=-2):
-   
-            # Posterior distribution of `batch_fx`.
-            post_batch_fx = self.output_post_batch_fx()
-   
-         with pyro.plate("KRxG", K*R, dim=-2):
-
-            # Posterior distribution of `mod`.
-            post_mod = self.output_post_mod()
-   
-   
-      with pyro.plate("ncells", self.ncells, dim=-2,
-         subsample_size=self.subsample_size, device=self.device) as indx_n:
-
-         # Posterior distribution of `c_indx`.
-         post_c_indx = self.output_post_c_indx(self.cmask, indx_n)
-   
-         # Posterior distribution of `log_theta`.
-         post_log_theta = self.output_post_log_theta(self.lmask, indx_n)
-
-         # Posterior distribution of `shift_n`.
-         post_shift = self.output_post_shift_n(indx_n)
-
-         with pyro.plate("ncellsxG", G, dim=-1):
-
-             post_rate_n = self.output_post_latent_x_i(indx_n)
-   
 
 if __name__ == "__main__":
 
