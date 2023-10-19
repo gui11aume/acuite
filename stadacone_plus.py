@@ -67,7 +67,8 @@ class Stadacone(torch.nn.Module):
       )
 
       # 1) Define the model.
-      self.output_scale_tril = self.sample_scale_tril
+      self.output_scale_tril_unit = self.sample_scale_tril_unit
+      self.output_scale_factor = self.sample_scale_factor
       self.output_global_base = self.sample_global_base
       self.output_wiggle = self.sample_wiggle
       self.output_base = self.sample_base
@@ -173,16 +174,28 @@ class Stadacone(torch.nn.Module):
       return tensor.index_select(0, idx.to(tensor.device))
 
    #  ==  Model parts == #
-   def sample_scale_tril(self):
-      scale_tril = pyro.sample(
-            name = "scale_tril",
-            # dim(scale_tril): (P x 1) x 1 | C x C
+   def sample_scale_tril_unit(self):
+      scale_tril_unit = pyro.sample(
+            name = "scale_tril_unit",
+            # dim(scale_tril_unit): (P x 1) x 1 | C x C
             fn = dist.LKJCholesky(
                 dim = C,
                 concentration = torch.ones(1).to(self.device)
             ),
       )
-      return scale_tril
+      return scale_tril_unit
+
+   def sample_scale_factor(self):
+      scale_factor = pyro.sample(
+            name = "scale_factor",
+            # dim(scale_factor): (P x 1) x C
+            fn = dist.Exponential(
+                rate = torch.ones(1).to(self.device),
+            ),
+      )
+      # dim(scale_factor): (P x 1) x 1 x C
+      scale_factor = scale_factor.unsqueeze(-2)
+      return scale_factor
 
    def sample_global_base(self): 
       global_base = pyro.sample(
@@ -411,12 +424,30 @@ class Stadacone(torch.nn.Module):
 
       # The correlation between cell types is given by the LKJ
       # distribution with parameter eta = 1, which is a uniform
-      # prior over  Cx C correlation matrices. The parameter
-      # `scale_tril` is not the correlation matrix but the lower
-      # Cholesky factor of the correlation matrix. It can be
-      # passed directly to `MultivariateNormal`.
+      # prior over C x C correlation matrices. The parameter
+      # `scale_tril_unit` is not the correlation matrix but the
+      # lower Cholesky factor of the correlation matrix. It can
+      # be passed directly to `MultivariateNormal`.
 
-      scale_tril = self.output_scale_tril()
+      # dim(scale_tril_unit): (P x 1) x 1 | C x C
+      scale_tril_unit = self.output_scale_tril_unit()
+
+      with pyro.plate("C", C, dim=-1):
+
+          # The parameter `scale_factor` describes the standard
+          # deviations for every cell type from the global
+          # baseline. The prior is exponential, with 90% weight
+          # in the interval (0.05, 3.00). The standard deviation
+          # is applied to all the genes so it describes how far
+          # the cell type is from the global baseline.
+
+          # dim(scale_factor): (P x 1) x 1 x C
+          scale_factor = self.output_scale_factor()
+
+      # Set up `scale_tril` from the correlation and the standard
+      # deviation. This is the lower Cholesky factor of the co-
+      # variance matrix (can be used directly in `Normal`).
+      scale_tril = scale_factor.unsqueeze(-1) * scale_tril_unit
 
       # Per-gene sampling.
       with pyro.plate("G", G, dim=-2):
