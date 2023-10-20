@@ -70,6 +70,7 @@ class Stadacone(torch.nn.Module):
       self.output_scale_factor = self.sample_scale_factor
       self.output_log_wiggle_loc = self.sample_log_wiggle_loc
       self.output_log_wiggle_scale = self.sample_log_wiggle_scale
+      self.output_batch_fx_scale = self.sample_batch_fx_scale
       self.output_global_base = self.sample_global_base
       self.output_wiggle = self.sample_wiggle
       self.output_base = self.sample_base
@@ -207,6 +208,16 @@ class Stadacone(torch.nn.Module):
       )
       return log_wiggle_scale
 
+   def sample_batch_fx_scale(self):
+      batch_fx_scale = pyro.sample(
+            name = "batch_fx_scale",
+            # dim(base): (P x 1) x B
+            fn = dist.Exponential(
+               3. * torch.ones(1).to(self.device),
+            ),
+      )
+      return batch_fx_scale
+
    def sample_scale_factor(self):
       scale_factor = pyro.sample(
             name = "scale_factor",
@@ -233,7 +244,7 @@ class Stadacone(torch.nn.Module):
 
    def sample_base(self, loc, scale_tril): 
       base_0 = pyro.sample(
-            name = "base",
+            name = "base_0",
             # dim(base_0): (P) x G x 1 | C
             fn = dist.MultivariateNormal(
                 torch.zeros(C).to(self.device),
@@ -254,13 +265,13 @@ class Stadacone(torch.nn.Module):
       wiggle = wiggle_Gx1.transpose(-1,-2)
       return wiggle
 
-   def sample_batch_fx(self):
+   def sample_batch_fx(self, scale):
       batch_fx = pyro.sample(
             name = "batch_fx",
             # dim(base): (P) x G x B
             fn = dist.Normal(
-               .00 * torch.zeros(1,1).to(self.device),
-               .05 * torch.ones(1,1).to(self.device)
+               torch.zeros(1,1).to(self.device),
+               scale
             ),
       )
       return batch_fx
@@ -418,25 +429,6 @@ class Stadacone(torch.nn.Module):
       )
       return x_i
 
-   def sample_post_rate_n(self, indx_n):
-      post_rate_n_loc = pyro.param(
-            "post_rate_n_loc",
-            lambda: 0 * torch.zeros(self.ncells,G).to(device),
-      )
-      post_rate_n_scale = pyro.param(
-            "post_rate_n_scale",
-            lambda: .1 * torch.ones(self.ncells,G).to(device),
-            constraint = constraints.positive
-      )
-      post_rate_n = pyro.sample(
-            name = "rate_n",
-            fn = dist.LogNormal(
-               self.subset(post_rate_n_loc, indx_n),
-               self.subset(post_rate_n_scale, indx_n),
-            ),
-      )
-      return post_rate_n
-
 
    #  ==  model description == #
    def model(self):
@@ -462,6 +454,15 @@ class Stadacone(torch.nn.Module):
 
           # dim(scale_factor): (P x 1) x 1 x C
           scale_factor = self.output_scale_factor()
+
+
+      with pyro.plate("B", B, dim=-1):
+
+          # TODO: describe prior.
+
+          # dim(batch_fx_scale): (P x 1) x B
+          batch_fx_scale = self.output_batch_fx_scale()
+
 
       # Set up `scale_tril` from the correlation and the standard
       # deviation. This is the lower Cholesky factor of the co-
@@ -507,7 +508,6 @@ class Stadacone(torch.nn.Module):
          # TODO: describe prior.
 
          # dim(base): (P) x 1 x G
-         import pdb; pdb.set_trace()
          wiggle = self.output_wiggle(log_wiggle_loc, log_wiggle_scale)
    
          # Per-batch, per-gene sampling.
@@ -518,7 +518,7 @@ class Stadacone(torch.nn.Module):
             # 95% of the genes.
 
             # dim(base): (P) x G x B
-            batch_fx = self.output_batch_fx()
+            batch_fx = self.output_batch_fx(batch_fx_scale)
    
          # Per-unit, per-type, per-gene sampling.
          with pyro.plate("GxKR", K*R, dim=-1):
