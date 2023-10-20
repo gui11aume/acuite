@@ -1,4 +1,3 @@
-import numpy as np
 import pyro
 import pyro.distributions as dist
 import sys
@@ -69,6 +68,8 @@ class Stadacone(torch.nn.Module):
       # 1) Define the model.
       self.output_scale_tril_unit = self.sample_scale_tril_unit
       self.output_scale_factor = self.sample_scale_factor
+      self.output_log_wiggle_loc = self.sample_log_wiggle_loc
+      self.output_log_wiggle_scale = self.sample_log_wiggle_scale
       self.output_global_base = self.sample_global_base
       self.output_wiggle = self.sample_wiggle
       self.output_base = self.sample_base
@@ -185,6 +186,27 @@ class Stadacone(torch.nn.Module):
       )
       return scale_tril_unit
 
+   def sample_log_wiggle_loc(self):
+      log_wiggle_loc = pyro.sample(
+            name = "log_wiggle_loc",
+            # dim(log_wiggle_loc): (P x 1) x 1
+            fn = dist.Normal(
+                0. * torch.ones(1).to(self.device),
+                1. * torch.ones(1).to(self.device)
+            ),
+      )
+      return log_wiggle_loc
+
+   def sample_log_wiggle_scale(self):
+      log_wiggle_scale = pyro.sample(
+            name = "log_wiggle_scale",
+            # dim(log_wiggle_scale): (P x 1) x 1
+            fn = dist.Exponential(
+                3. * torch.ones(1).to(self.device),
+            ),
+      )
+      return log_wiggle_scale
+
    def sample_scale_factor(self):
       scale_factor = pyro.sample(
             name = "scale_factor",
@@ -222,14 +244,11 @@ class Stadacone(torch.nn.Module):
       base = loc + base_0.squeeze(-2)
       return base
 
-   def sample_wiggle(self):
+   def sample_wiggle(self, loc, scale):
       wiggle_Gx1 = pyro.sample(
             name = "wiggle_Gx1",
             # dim(wiggle_Gx1): (P) x G x 1
-            fn = dist.LogNormal(
-                -2.0 * torch.ones(1).to(self.device),
-                 1.2 * torch.ones(1).to(self.device)
-            ),
+            fn = dist.LogNormal(loc, scale),
       )
       # dim(wiggle): (P) x 1 x G
       wiggle = wiggle_Gx1.transpose(-1,-2)
@@ -449,6 +468,12 @@ class Stadacone(torch.nn.Module):
       # variance matrix (can be used directly in `Normal`).
       scale_tril = scale_factor.unsqueeze(-1) * scale_tril_unit
 
+      # dim(log_wiggle_loc): (P x 1) x 1
+      log_wiggle_loc = self.output_log_wiggle_loc()
+
+      # dim(log_wiggle_scale): (P x 1) x 1
+      log_wiggle_scale = self.output_log_wiggle_scale()
+
       # Per-gene sampling.
       with pyro.plate("G", G, dim=-2):
    
@@ -482,7 +507,8 @@ class Stadacone(torch.nn.Module):
          # TODO: describe prior.
 
          # dim(base): (P) x 1 x G
-         wiggle = self.output_wiggle()
+         import pdb; pdb.set_trace()
+         wiggle = self.output_wiggle(log_wiggle_loc, log_wiggle_scale)
    
          # Per-batch, per-gene sampling.
          with pyro.plate("GxB", B, dim=-1):
