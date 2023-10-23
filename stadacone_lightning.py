@@ -102,7 +102,7 @@ class plTrainHarness(pl.LightningModule):
       loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
       (current_lr,) = self.lr_schedulers().get_last_lr()
       info = { "loss": loss, "lr": current_lr }
-      self.log_dict(dictionary=info, on_step = True, prog_bar = True)
+      self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
       return loss
 
 
@@ -613,7 +613,7 @@ if __name__ == "__main__":
    harnessed = plTrainHarness(stadacone)
 
    trainer = pl.Trainer(
-      default_root_dir = "checkpoints",
+      default_root_dir = ".",
 #      strategy = pl.strategies.FSDPStrategy(
 ##         cpu_offload = torch.distributed.fsdp.CPUOffload(offload_params=True),
 #         activation_checkpointing = [
@@ -629,14 +629,14 @@ if __name__ == "__main__":
 #      ),
       strategy = pl.strategies.DDPStrategy(find_unused_parameters=False),
       accelerator = "gpu",
-      precision = "bf16",
+      precision = "bf16-mixed",
       devices = 1 if DEBUG else -1,
       gradient_clip_val = 1.0,
 #      accumulate_grad_batches = ACC,
       max_epochs = CELL_COVERAGE,
       enable_progress_bar = True,
       enable_model_summary = True,
-      logger = True,
+      logger = pl.loggers.CSVLogger("."),
       # Checkpointing.
       enable_checkpointing = True,
    )
