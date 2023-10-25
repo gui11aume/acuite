@@ -106,7 +106,6 @@ class plTrainHarness(pl.LightningModule):
       return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
    
    def training_step(self, batch, batch_idx):
-      import pdb; pdb.set_trace()
       loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
       (current_lr,) = self.lr_schedulers().get_last_lr()
       info = { "loss": loss, "lr": current_lr }
@@ -187,7 +186,6 @@ class Stadacone(torch.nn.Module):
       self.output_wiggle = self.sample_wiggle
       self.output_base = self.sample_base
       self.output_shift_n = self.sample_shift_n
-      self.output_batch_fx_n = self.compute_batch_fx_n
       self.output_x_i = self.compute_ELBO_rate_n
 
       # 1b) Define optional parts of the model.
@@ -206,10 +204,12 @@ class Stadacone(torch.nn.Module):
          self.need_to_infer_batch_fx = True
          self.output_batch_fx_scale = self.sample_batch_fx_scale
          self.output_batch_fx = self.sample_batch_fx
+         self.output_batch_fx_n = self.compute_batch_fx_n
       else:
          self.need_to_infer_batch_fx = False
          self.output_batch_fx_scale = self.zero
          self.output_batch_fx = self.zero
+         self.output_batch_fx_n = self.zero
 
       if cmask.all():
          self.need_to_infer_cell_type = False
