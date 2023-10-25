@@ -7,10 +7,13 @@ import torch.nn.functional as F
 
 from pyro.distributions import constraints
 from pyro.infer.autoguide import (
-      AutoDiscreteParallel,
+#      AutoDiscreteParallel,
       AutoGuideList,
+      AutoGuide,
       AutoNormal,
 )
+
+from contextlib import ExitStack
 
 from misc_stadacone import (
       xSVI,
@@ -40,6 +43,10 @@ class DummyModule(torch.nn.Module):
    def __init__(self, params):
       super().__init__()
       self.params = params
+
+def subset(tensor, idx):
+   if tensor is None: return None
+   return tensor.index_select(0, idx.to(tensor.device))
 
 
 class plTrainHarness(pl.LightningModule):
@@ -99,12 +106,55 @@ class plTrainHarness(pl.LightningModule):
       return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
    
    def training_step(self, batch, batch_idx):
+      import pdb; pdb.set_trace()
       loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
       (current_lr,) = self.lr_schedulers().get_last_lr()
       info = { "loss": loss, "lr": current_lr }
       self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
       return loss
 
+
+# This part of the model should be created with `AutoDiscreteParallel`
+# but there is a bug (https://github.com/pyro-ppl/pyro/issues/3286).
+# This should be eventually replaced when the bug is fixed.
+class c_indx_autoguide(AutoGuide):
+   def __init__(self, pyro_model, device, ncells, cmask):
+      super().__init__(model=pyro_model)
+      self.device = device
+      self.ncells = ncells
+      self.cmask = cmask
+
+   def _setup_prototype(self):
+      model = pyro.poutine.block(pyro.infer.enum.config_enumerate(self.model), self._prototype_hide_fn)
+      self.prototype_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)()
+      self._cond_indep_stacks = {}
+      for name, site in self.prototype_trace.iter_stochastic_nodes():
+          self._cond_indep_stacks[name] = site["cond_indep_stack"]
+
+   def forward(self, idx=None, *args, **kwargs):
+      if self.prototype_trace is None:
+          self._setup_prototype(*args, **kwargs)
+
+      plates = self._create_plates(*args, **kwargs)
+      with ExitStack() as stack:
+         for frame in self._cond_indep_stacks["cell_type_unobserved"]:
+             stack.enter_context(plates[frame.name])
+         # Posterior distribution of 'c_indx'.
+         post_c_indx_param = pyro.param(
+               "post_c_indx_param",
+               lambda: torch.ones(self.ncells,1,C).to(self.device),
+               constraint = torch.distributions.constraints.simplex
+         )
+         with pyro.poutine.mask(mask=subset(~self.cmask, idx)):
+            c_indx = pyro.sample(
+                  name = "cell_type_unobserved",
+                  # dim(c_indx): C x 1 x 1 x 1 | .
+                  fn = dist.Categorical(
+                     subset(post_c_indx_param, idx) # dim: ncells x 1 x C
+                  ),
+                  infer={ "enumerate": "parallel" },
+            )
+      return { "cell_type_unobserved": c_indx }
 
 class Stadacone(torch.nn.Module):
 
@@ -133,11 +183,9 @@ class Stadacone(torch.nn.Module):
       self.output_scale_factor = self.sample_scale_factor
       self.output_log_wiggle_loc = self.sample_log_wiggle_loc
       self.output_log_wiggle_scale = self.sample_log_wiggle_scale
-      self.output_batch_fx_scale = self.sample_batch_fx_scale
       self.output_global_base = self.sample_global_base
       self.output_wiggle = self.sample_wiggle
       self.output_base = self.sample_base
-      self.output_batch_fx = self.sample_batch_fx
       self.output_shift_n = self.sample_shift_n
       self.output_batch_fx_n = self.compute_batch_fx_n
       self.output_x_i = self.compute_ELBO_rate_n
@@ -154,6 +202,15 @@ class Stadacone(torch.nn.Module):
          self.output_theta_n = self.zero
          self.output_units_n = self.zero
 
+      if B > 1:
+         self.need_to_infer_batch_fx = True
+         self.output_batch_fx_scale = self.sample_batch_fx_scale
+         self.output_batch_fx = self.sample_batch_fx
+      else:
+         self.need_to_infer_batch_fx = False
+         self.output_batch_fx_scale = self.zero
+         self.output_batch_fx = self.zero
+
       if cmask.all():
          self.need_to_infer_cell_type = False
          self.output_c_indx = self.subset_c_indx
@@ -168,17 +225,18 @@ class Stadacone(torch.nn.Module):
       
       # 2) Define the guide.
       self.guide = AutoGuideList(self.model)
-      self.guide.append(AutoNormal(pyro.poutine.block(self.model, hide=["cell_type_unobserved"])))
-      self.guide.append(AutoDiscreteParallel(pyro.poutine.block(self.model, expose=["cell_type_unobserved"])))
+      self.guide.append(AutoNormal(
+          pyro.poutine.block(self.model, hide=["cell_type_unobserved"])
+      ))
+      self.guide.append(c_indx_autoguide(
+          pyro.poutine.block(self.model, expose=["cell_type_unobserved"]),
+          device=self.device, ncells=self.ncells, cmask=self.cmask
+      ))
 
 
    #  == Helper functions == #
    def zero(self, *args, **kwargs):
       return 0.
-
-   def subset(self, tensor, idx):
-      if tensor is None: return None
-      return tensor.index_select(0, idx.to(tensor.device))
 
    #  ==  Model parts == #
    def sample_scale_tril_unit(self):
@@ -301,14 +359,14 @@ class Stadacone(torch.nn.Module):
             fn = dist.Categorical(
                torch.ones(1,1,C).to(self.device),
             ),
-            obs = self.subset(ctype, indx_n),
-            obs_mask = self.subset(cmask, indx_n)
+            obs = subset(ctype, indx_n),
+            obs_mask = subset(cmask, indx_n)
       )
       return c_indx
 
    def subset_c_indx(self, ctype, cmask, indx_n):
       # dim(c_indx): ncells x 1
-      c_indx = self.subset(ctype, indx_n)
+      c_indx = subset(ctype, indx_n)
       return c_indx
 
    def sample_theta_n(self, lab, lmask, indx_n):
@@ -319,8 +377,8 @@ class Stadacone(torch.nn.Module):
                torch.zeros(1,1,K).to(self.device),
                torch.ones(1,1,K).to(self.device)
             ).to_event(1),
-            obs = self.subset(self.smooth_lab, indx_n),
-            obs_mask = self.subset(lmask, indx_n)
+            obs = subset(self.smooth_lab, indx_n),
+            obs_mask = subset(lmask, indx_n)
       ) 
       # dim(theta_n): (P) x ncells x 1 x K
       theta_n = log_theta_n.softmax(dim=-1)
@@ -355,14 +413,14 @@ class Stadacone(torch.nn.Module):
 
    def compute_batch_fx_n(self, batch, batch_fx, indx_n, dtype):
       # dim(ohg): ncells x B
-      ohb = self.subset(F.one_hot(batch).to(dtype), indx_n)
+      ohb = subset(F.one_hot(batch).to(dtype), indx_n)
       # dim(batch_fx_n): (P) x ncells x G
       batch_fx_n = torch.einsum("...GB,nB->...nG", batch_fx, ohb)
       return batch_fx_n
 
    def compute_units_n(self, group, theta_n, units, indx_n):
       # dim(ohg): ncells x R
-      ohg = self.subset(F.one_hot(group).to(units.dtype), indx_n)
+      ohg = subset(F.one_hot(group).to(units.dtype), indx_n)
       # dim(units_n): (P) x ncells x G
       units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
       return units_n
@@ -416,7 +474,6 @@ class Stadacone(torch.nn.Module):
             obs_mask = gmask
       )
       return x_i
-
 
    #  ==  model description == #
    def model(self, idx=None):
@@ -558,8 +615,8 @@ class Stadacone(torch.nn.Module):
          with pyro.plate("ncellsxG", G, dim=-1):
 
             mu = base_n + batch_fx_n + units_n + shift_n
-            x_i = self.subset(self.X, indx_n).to_dense()
-            x_i_mask = self.subset(self.gmask, indx_n)
+            x_i = subset(self.X, indx_n).to_dense()
+            x_i_mask = subset(self.gmask, indx_n)
 
             self.output_x_i(x_i, mu, wiggle, x_i_mask)
 
