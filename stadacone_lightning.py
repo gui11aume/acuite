@@ -30,7 +30,7 @@ global C # Number of types / from data.
 global R # Number of groups / from data.
 global G # Number of genes / from data.
 
-DEBUG = True
+DEBUG = False
 SUBSMPL = 256
 NUM_PARTICLES = 8
 CELL_COVERAGE = 100
@@ -116,6 +116,7 @@ class plTrainHarness(pl.LightningModule):
 # This part of the model should be created with `AutoDiscreteParallel`
 # but there is a bug (https://github.com/pyro-ppl/pyro/issues/3286).
 # This should be eventually replaced when the bug is fixed.
+
 class c_indx_autoguide(AutoGuide):
    def __init__(self, pyro_model, device, ncells, cmask):
       super().__init__(model=pyro_model)
@@ -127,18 +128,21 @@ class c_indx_autoguide(AutoGuide):
       model = pyro.poutine.block(pyro.infer.enum.config_enumerate(self.model), self._prototype_hide_fn)
       self.prototype_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)()
       self._cond_indep_stacks = {}
+      self._prototype_frames = {}
       for name, site in self.prototype_trace.iter_stochastic_nodes():
           self._cond_indep_stacks[name] = site["cond_indep_stack"]
+          for frame in site["cond_indep_stack"]:
+              self._prototype_frames[frame.name] = frame
 
-   def forward(self, idx=None, *args, **kwargs):
+   def forward(self, idx=None):
       if self.prototype_trace is None:
-          self._setup_prototype(*args, **kwargs)
+          self._setup_prototype()
 
-      plates = self._create_plates(*args, **kwargs)
+      plates = self._create_plates()
       with ExitStack() as stack:
          for frame in self._cond_indep_stacks["cell_type_unobserved"]:
              stack.enter_context(plates[frame.name])
-         # Posterior distribution of 'c_indx'.
+         # Posterior distribution of `c_indx`.
          post_c_indx_param = pyro.param(
                "post_c_indx_param",
                lambda: torch.ones(self.ncells,1,C).to(self.device),
@@ -224,19 +228,27 @@ class Stadacone(torch.nn.Module):
          self.output_x_i = self.sample_rate_n
       
       # 2) Define the guide.
-      self.guide = AutoGuideList(self.model)
+      self.guide = AutoGuideList(
+          self.model,
+          create_plates = self.create_ncells_plates
+      )
       self.guide.append(AutoNormal(
-          pyro.poutine.block(self.model, hide=["cell_type_unobserved"])
+          pyro.poutine.block(self.model, hide = ["cell_type_unobserved"])
       ))
-      self.guide.append(c_indx_autoguide(
-          pyro.poutine.block(self.model, expose=["cell_type_unobserved"]),
-          device=self.device, ncells=self.ncells, cmask=self.cmask
-      ))
+      if self.need_to_infer_cell_type:
+         self.guide.append(c_indx_autoguide(
+             pyro.poutine.block(self.model, expose = ["cell_type_unobserved"]),
+             device = self.device, ncells = self.ncells, cmask = self.cmask
+         ))
 
 
    #  == Helper functions == #
    def zero(self, *args, **kwargs):
       return 0.
+
+   def create_ncells_plates(self, idx=None):
+      return pyro.plate("ncells", self.ncells, dim=-2,
+              subsample=idx, device=self.device)
 
    #  ==  Model parts == #
    def sample_scale_tril_unit(self):
@@ -572,8 +584,8 @@ class Stadacone(torch.nn.Module):
 
             # dim(units): (P) x G x K x R
             units = self.output_units()
-   
-   
+
+
       # Per-cell sampling (on dimension -2).
       with pyro.plate("ncells", self.ncells, dim=-2,
          subsample=idx, device=self.device) as indx_n:
