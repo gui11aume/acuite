@@ -7,7 +7,6 @@ import torch.nn.functional as F
 
 from pyro.distributions import constraints
 from pyro.infer.autoguide import (
-#      AutoDiscreteParallel,
       AutoGuideList,
       AutoGuide,
       AutoNormal,
@@ -91,16 +90,16 @@ class plTrainHarness(pl.LightningModule):
       n_decay_steps = int(0.95 * n_steps)
 
       warmup = torch.optim.lr_scheduler.LinearLR(
-          optimizer, start_factor=0.01, end_factor=1.0, total_iters=n_warmup_steps
+         optimizer, start_factor=0.01, end_factor=1.0, total_iters=n_warmup_steps
       )
       decay = torch.optim.lr_scheduler.LinearLR(
-          optimizer, start_factor=1.0, end_factor=0.01, total_iters=n_decay_steps
+         optimizer, start_factor=1.0, end_factor=0.01, total_iters=n_decay_steps
       )
 
       scheduler = torch.optim.lr_scheduler.SequentialLR(
-          optimizer=optimizer,
-          schedulers=[warmup, decay],
-          milestones=[n_warmup_steps],
+         optimizer=optimizer,
+         schedulers=[warmup, decay],
+         milestones=[n_warmup_steps],
       )
 
       return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
@@ -130,9 +129,17 @@ class c_indx_autoguide(AutoGuide):
       self._cond_indep_stacks = {}
       self._prototype_frames = {}
       for name, site in self.prototype_trace.iter_stochastic_nodes():
-          self._cond_indep_stacks[name] = site["cond_indep_stack"]
-          for frame in site["cond_indep_stack"]:
-              self._prototype_frames[frame.name] = frame
+         self._cond_indep_stacks[name] = site["cond_indep_stack"]
+         for frame in site["cond_indep_stack"]:
+            self._prototype_frames[frame.name] = frame
+      pyro.infer.autoguide.utils.deep_setattr(self,
+         "AutoGuideList.1.post_c_indx_probs",
+         pyro.nn.module.PyroParam(
+            torch.ones(self.ncells,1,C).to(self.device),
+            constraint = torch.distributions.constraints.simplex,
+            event_dim = 1
+         ),
+      )
 
    def forward(self, idx=None):
       if self.prototype_trace is None:
@@ -143,21 +150,20 @@ class c_indx_autoguide(AutoGuide):
          for frame in self._cond_indep_stacks["cell_type_unobserved"]:
              stack.enter_context(plates[frame.name])
          # Posterior distribution of `c_indx`.
-         post_c_indx_param = pyro.param(
-               "post_c_indx_param",
-               lambda: torch.ones(self.ncells,1,C).to(self.device),
-               constraint = torch.distributions.constraints.simplex
-         )
+         post_c_indx_probs = pyro.infer.autoguide.utils.deep_getattr(self,
+            "AutoGuideList.1.post_c_indx_probs")
          with pyro.poutine.mask(mask=subset(~self.cmask, idx)):
-            c_indx = pyro.sample(
-                  name = "cell_type_unobserved",
-                  # dim(c_indx): C x 1 x 1 x 1 | .
-                  fn = dist.Categorical(
-                     subset(post_c_indx_param, idx) # dim: ncells x 1 x C
-                  ),
-                  infer={ "enumerate": "parallel" },
+            post_c_indx = pyro.sample(
+               name = "cell_type_unobserved",
+               # dim(c_indx): C x 1 x 1 x 1 | .
+               fn = dist.Categorical(
+                  post_c_indx_probs # dim: ncells x 1 | C
+               ),
+               infer={ "enumerate": "parallel" },
             )
-      return { "cell_type_unobserved": c_indx }
+      return { "cell_type_unobserved": post_c_indx }
+
+
 
 class Stadacone(torch.nn.Module):
 
@@ -228,10 +234,7 @@ class Stadacone(torch.nn.Module):
          self.output_x_i = self.sample_rate_n
       
       # 2) Define the guide.
-      self.guide = AutoGuideList(
-          self.model,
-          create_plates = self.create_ncells_plates
-      )
+      self.guide = AutoGuideList(self.model)
       self.guide.append(AutoNormal(
           pyro.poutine.block(self.model, hide = ["cell_type_unobserved"])
       ))
@@ -246,9 +249,6 @@ class Stadacone(torch.nn.Module):
    def zero(self, *args, **kwargs):
       return 0.
 
-   def create_ncells_plates(self, idx=None):
-      return pyro.plate("ncells", self.ncells, dim=-2,
-              subsample=idx, device=self.device)
 
    #  ==  Model parts == #
    def sample_scale_tril_unit(self):
@@ -455,7 +455,7 @@ class Stadacone(torch.nn.Module):
       for _ in range(5):
          f = m + mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2)
          df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
-         mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - 1e-2)
+         mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - .01)
       # Set the optimal `w2_i` from the optimal `mu_i`.
       w2_i = 1. / (x_i + (1 - mu_i) / w2)
    
