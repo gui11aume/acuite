@@ -234,7 +234,7 @@ class Stadacone(torch.nn.Module):
          self.output_x_i = self.sample_rate_n
       
       # 2) Define the guide.
-      self.guide = AutoGuideList(self.model)
+      self.guide = AutoGuideList(self.model, create_plates=self.create_ncells_plate)
       self.guide.append(AutoNormal(
           pyro.poutine.block(self.model, hide = ["cell_type_unobserved"])
       ))
@@ -248,6 +248,10 @@ class Stadacone(torch.nn.Module):
    #  == Helper functions == #
    def zero(self, *args, **kwargs):
       return 0.
+
+   def create_ncells_plate(self, idx=None):
+      return pyro.plate("ncells", self.ncells, dim=-2,
+         subsample=idx, device=self.device)
 
 
    #  ==  Model parts == #
