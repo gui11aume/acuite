@@ -262,6 +262,28 @@ class Stadacone(torch.nn.Module):
       )
       return scale_tril_unit
 
+   def sample_scale_factor(self):
+      scale_factor = pyro.sample(
+            name = "scale_factor",
+            # dim(scale_factor): (P x 1) x C
+            fn = dist.Exponential(
+                rate = torch.ones(1).to(self.device),
+            ),
+      )
+      # dim(scale_factor): (P x 1) x 1 x C
+      scale_factor = scale_factor.unsqueeze(-2)
+      return scale_factor
+
+   def sample_batch_fx_scale(self):
+      batch_fx_scale = pyro.sample(
+            name = "batch_fx_scale",
+            # dim(base): (P x 1) x B
+            fn = dist.Exponential(
+               5. * torch.ones(1).to(self.device),
+            ),
+      )
+      return batch_fx_scale
+
    def sample_log_wiggle_loc(self):
       log_wiggle_loc = pyro.sample(
             name = "log_wiggle_loc",
@@ -282,28 +304,6 @@ class Stadacone(torch.nn.Module):
             ),
       )
       return log_wiggle_scale
-
-   def sample_batch_fx_scale(self):
-      batch_fx_scale = pyro.sample(
-            name = "batch_fx_scale",
-            # dim(base): (P x 1) x B
-            fn = dist.Exponential(
-               3. * torch.ones(1).to(self.device),
-            ),
-      )
-      return batch_fx_scale
-
-   def sample_scale_factor(self):
-      scale_factor = pyro.sample(
-            name = "scale_factor",
-            # dim(scale_factor): (P x 1) x C
-            fn = dist.Exponential(
-                rate = torch.ones(1).to(self.device),
-            ),
-      )
-      # dim(scale_factor): (P x 1) x 1 x C
-      scale_factor = scale_factor.unsqueeze(-2)
-      return scale_factor
 
    def sample_global_base(self): 
       global_base = pyro.sample(
@@ -488,6 +488,7 @@ class Stadacone(torch.nn.Module):
       return x_i
 
    #  ==  model description == #
+
    def model(self, idx=None):
 
       # The correlation between cell types is given by the LKJ
@@ -515,7 +516,12 @@ class Stadacone(torch.nn.Module):
 
       with pyro.plate("B", B, dim=-1):
 
-         # TODO: describe prior.
+         # The parameter `batch_fx_scale` describes the standard
+         # deviations for every batch from the transcriptome of
+         # the cell type. The prior is exponential, with 90% weight
+         # in the interval (0.01, 0.60). The standard deviation
+         # is applied to all the genes so it describes how far
+         # the batch is from the prototype transcriptome.
 
          # dim(batch_fx_scale): (P x 1) x B
          batch_fx_scale = self.output_batch_fx_scale()
@@ -524,10 +530,24 @@ class Stadacone(torch.nn.Module):
       # Set up `scale_tril` from the correlation and the standard
       # deviation. This is the lower Cholesky factor of the co-
       # variance matrix (can be used directly in `Normal`).
+
+      # dim()scale_tril: (P x 1) x 1 x C x C
       scale_tril = scale_factor.unsqueeze(-1) * scale_tril_unit
+
+      # The parameter `log_wiggle_loc` is the location parameter
+      # for the parameter `wiggle`. The prior is Gaussian, with
+      # 90% weight in the interval (-2.7, 0.7) and since `wiggle`
+      # is log-normal, its median has 90% chance of being in the
+      # interval (0.07, 1.9).
 
       # dim(log_wiggle_loc): (P x 1) x 1
       log_wiggle_loc = self.output_log_wiggle_loc()
+
+      # The parameter `log_wiggle_scale` is the scale parameter
+      # for the parameter `wiggle`. The prior is exponential,
+      # with 90% weight in the interval (.02, 1.00), which
+      # indicates the typical dispersion of `wiggle` as a log-
+      # normal variable.
 
       # dim(log_wiggle_scale): (P x 1) x 1
       log_wiggle_scale = self.output_log_wiggle_scale()
@@ -562,7 +582,14 @@ class Stadacone(torch.nn.Module):
          # dim(base): (P) G x 1 | C
          base = self.output_base(global_base, scale_tril)
 
-         # TODO: describe prior.
+         # The parameter `wiggle` describes the standard deviations
+         # for genes in the transcriptome. The prior is log-normal
+         # with location parameter `log_wiggle_loc` and scale
+         # parameter `log_wiggle_scale`. For every gene, the
+         # standard deviation is applied to all the cells, so it
+         # describes how "fuzzy" a gene is, or on the contrary how
+         # much it is determined by the cell type and its break down
+         # in transcriptional units.
 
          # dim(base): (P) x 1 x G
          wiggle = self.output_wiggle(log_wiggle_loc, log_wiggle_scale)
