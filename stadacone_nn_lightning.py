@@ -119,18 +119,20 @@ class plTrainHarness(pl.LightningModule):
 # This should be eventually replaced when the bug is fixed.
 
 class cell_autoguide(AutoGuide):
-   def __init__(self, pyro_model, device, X, ncells, cmask, cell_type_encoder, shift_encoder):
+   def __init__(self, pyro_model, device, X, ncells, bsz, cmask, cell_type_encoder, shift_encoder):
       super().__init__(model=pyro_model)
       self.X = X
       self.device = device
       self.ncells = ncells
+      self.bsz = bsz
       self.cmask = cmask
       self.cell_type_encoder = cell_type_encoder
       self.shift_encoder = shift_encoder
 
    def _setup_prototype(self):
       model = pyro.poutine.block(pyro.infer.enum.config_enumerate(self.model), self._prototype_hide_fn)
-      self.prototype_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)()
+      idx = torch.randperm(self.ncells)[:self.bsz]
+      self.prototype_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)(idx)
       self._cond_indep_stacks = {}
       self._prototype_frames = {}
       for name, site in self.prototype_trace.iter_stochastic_nodes():
@@ -296,6 +298,7 @@ class Stadacone(torch.nn.Module):
                 device = self.device,
                 X = self.X,
                 ncells = self.ncells,
+                bsz = self.bsz,
                 cmask = self.cmask,
                 cell_type_encoder = self.cell_type_encoder,
                 shift_encoder = self.shift_encoder,
