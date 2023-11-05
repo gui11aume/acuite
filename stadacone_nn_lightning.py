@@ -32,16 +32,12 @@ global G # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 256
 NUM_PARTICLES = 12
-CELL_COVERAGE = 40
+NUM_EPOCHS = 10
 
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
 
-class DummyModule(torch.nn.Module):
-   def __init__(self, params):
-      super().__init__()
-      self.params = params
 
 def subset(tensor, idx):
    if tensor is None: return None
@@ -49,7 +45,7 @@ def subset(tensor, idx):
 
 
 class plTrainHarness(pl.LightningModule):
-   def __init__(self, stadacone, lr=.01):
+   def __init__(self, stadacone, lr=.002):
       super().__init__()
       self.stadacone = stadacone
       self.pyro_model = stadacone.model
@@ -71,22 +67,23 @@ class plTrainHarness(pl.LightningModule):
             ignore_jit_warnings = True,
          )
 
-      # Register a model that does nothing but that 
-      # has the parameters of the guide. This allows
-      # the optimizer to do its job.
-      stadacone_params = self.capture_params()
-      self.model = DummyModule(stadacone_params)
+      # Auto-instantiate parameters.
+      self.capture_params()
 
    def capture_params(self):
       idx = torch.randperm(self.stadacone.ncells)[:self.stadacone.bsz]
       with pyro.poutine.trace(param_only=True) as param_capture:
          self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
-      params = set(site["value"].unconstrained()
-            for site in param_capture.trace.nodes.values())
+      params = { site["name"]:site["value"].unconstrained()
+            for site in param_capture.trace.nodes.values() }
       return params
 
    def configure_optimizers(self):
-      optimizer = torch.optim.Adam(self.trainer.model.parameters(), lr=0.01)
+      optimizer = torch.optim.Adam(
+          self.trainer.model.parameters(), lr=0.01,
+#          { "params": self.trainer.model.module.model.pyro.parameters(), "lr": 0.01 },
+#          { "params": self.trainer.model.module.model.nn.parameters(), "lr": 0.001 },
+      )
 
       n_steps = self.trainer.estimated_stepping_batches
       n_warmup_steps = int(0.05 * n_steps)
@@ -109,8 +106,10 @@ class plTrainHarness(pl.LightningModule):
    
    def training_step(self, batch, batch_idx):
       loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
-      (current_lr,) = self.lr_schedulers().get_last_lr()
-      info = { "loss": loss, "lr": current_lr }
+#      (lr_pyro, lr_nn) = self.lr_schedulers().get_last_lr()
+#      info = { "loss": loss, "lr(pyro)": lr_pyro , "lr(nn)": lr_nn}
+      (lr,) = self.lr_schedulers().get_last_lr()
+      info = { "loss": loss, "lr": lr }
       self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
       return loss
 
@@ -148,11 +147,13 @@ class cell_autoguide(AutoGuide):
          for frame in self._cond_indep_stacks["cell_type_unobserved"]:
              stack.enter_context(plates[frame.name])
          # Posterior distribution of `c_indx`.
-         x_i = subset(self.X.float(), idx).to_dense()
+         dtype = self.cell_type_encoder.layer1.weight.dtype
+         x_i = subset(self.X, idx).to_dense().to(dtype)
          #x_i_mask = subset(self.gmask, idx) # <== prepare for later.
 
          # dim(cell_type_probs): ncells x 1 x C
-         cell_type_probs = self.cell_type_encoder(torch.softmax(x_i, dim=-1)).unsqueeze(-2)
+         f_i = torch.softmax(x_i, dim=-1)
+         cell_type_probs = self.cell_type_encoder(f_i).unsqueeze(-2)
          with pyro.poutine.mask(mask=subset(~self.cmask, idx)):
             post_c_indx = pyro.sample(
                name = "cell_type_unobserved",
@@ -235,8 +236,8 @@ class Stadacone(torch.nn.Module):
       # Define and register encoders.
       self.cell_type_encoder = CellTypeEncoder(G,C).to(self.device)
       self.shift_encoder = ShiftEncoder(G).to(self.device)
-      pyro.module("cell_type_encoder", self.cell_type_encoder)
-      pyro.module("shift_encoder", self.shift_encoder)
+#      pyro.module("cell_type_encoder", self.cell_type_encoder)
+#      pyro.module("shift_encoder", self.shift_encoder)
 
       # 1a) Define core parts of the model.
       self.output_scale_tril_unit = self.sample_scale_tril_unit
@@ -775,26 +776,14 @@ if __name__ == "__main__":
 
    trainer = pl.Trainer(
       default_root_dir = ".",
-#      strategy = pl.strategies.FSDPStrategy(
-##         cpu_offload = torch.distributed.fsdp.CPUOffload(offload_params=True),
-#         activation_checkpointing = [
-#            transformers.models.bert.modeling_bert.BertLayer,
-#            transformers.models.bert.modeling_camembert.CamembertLayer,
-#         ],
-#         mixed_precision = torch.distributed.fsdp.MixedPrecision(
-#            param_dtype=torch.bfloat16,
-#            reduce_dtype=torch.bfloat16,
-#            buffer_dtype=torch.bfloat16,
-#         ),
-#         auto_wrap_policy = wrapping_policy
-#      ),
-      strategy = pl.strategies.DDPStrategy(find_unused_parameters=False),
+#      strategy = "ddp",
+      strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
       precision = "32",
       devices = 1 if DEBUG else -1,
       gradient_clip_val = 1.0,
 #      accumulate_grad_batches = ACC,
-      max_epochs = CELL_COVERAGE,
+      max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
       enable_model_summary = True,
       logger = pl.loggers.CSVLogger("."),
@@ -803,4 +792,9 @@ if __name__ == "__main__":
    )
 
    trainer.fit(harnessed, data_loader)
-   pyro.get_param_store().save(out_path)
+
+   # Save output to file.
+   param_store = pyro.get_param_store().get_state()
+   for key, value in param_store["params"].items():
+       param_store["params"][key] = value.clone().cpu()
+   torch.save(param_store, out_path)
