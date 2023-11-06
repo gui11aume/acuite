@@ -71,9 +71,13 @@ class plTrainHarness(pl.LightningModule):
       self.capture_params()
 
    def capture_params(self):
-      idx = torch.randperm(self.stadacone.ncells)[:self.stadacone.bsz]
       with pyro.poutine.trace(param_only=True) as param_capture:
-         self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
+         self.elbo.differentiable_loss(
+                 model = self.pyro_model,
+                 guide = self.pyro_guide,
+                 # Params.
+                 idx = torch.tensor([0])
+         )
       params = { site["name"]:site["value"].unconstrained()
             for site in param_capture.trace.nodes.values() }
       return params
@@ -81,8 +85,6 @@ class plTrainHarness(pl.LightningModule):
    def configure_optimizers(self):
       optimizer = torch.optim.Adam(
           self.trainer.model.parameters(), lr=0.01,
-#          { "params": self.trainer.model.module.model.pyro.parameters(), "lr": 0.01 },
-#          { "params": self.trainer.model.module.model.nn.parameters(), "lr": 0.001 },
       )
 
       n_steps = self.trainer.estimated_stepping_batches
@@ -106,17 +108,11 @@ class plTrainHarness(pl.LightningModule):
    
    def training_step(self, batch, batch_idx):
       loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
-#      (lr_pyro, lr_nn) = self.lr_schedulers().get_last_lr()
-#      info = { "loss": loss, "lr(pyro)": lr_pyro , "lr(nn)": lr_nn}
       (lr,) = self.lr_schedulers().get_last_lr()
       info = { "loss": loss, "lr": lr }
       self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
       return loss
 
-
-# This part of the model should be created with `AutoDiscreteParallel`
-# but there is a bug (https://github.com/pyro-ppl/pyro/issues/3286).
-# This should be eventually replaced when the bug is fixed.
 
 class cell_autoguide(AutoGuide):
    def __init__(self, pyro_model, device, X, ncells, bsz, cmask, cell_type_encoder, shift_encoder):
@@ -131,8 +127,8 @@ class cell_autoguide(AutoGuide):
 
    def _setup_prototype(self):
       model = pyro.poutine.block(pyro.infer.enum.config_enumerate(self.model), self._prototype_hide_fn)
-      idx = torch.randperm(self.ncells)[:self.bsz]
-      self.prototype_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)(idx)
+      get_trace = pyro.poutine.block(pyro.poutine.trace(model).get_trace)
+      self.prototype_trace = get_trace(idx = torch.tensor([0]))
       self._cond_indep_stacks = {}
       self._prototype_frames = {}
       for name, site in self.prototype_trace.iter_stochastic_nodes():
@@ -151,7 +147,6 @@ class cell_autoguide(AutoGuide):
          # Posterior distribution of `c_indx`.
          dtype = self.cell_type_encoder.layer1.weight.dtype
          x_i = subset(self.X, idx).to_dense().to(dtype)
-         #x_i_mask = subset(self.gmask, idx) # <== prepare for later.
 
          # dim(cell_type_probs): ncells x 1 x C
          f_i = torch.softmax(x_i, dim=-1)
@@ -160,7 +155,7 @@ class cell_autoguide(AutoGuide):
             post_c_indx = pyro.sample(
                name = "cell_type_unobserved",
                # dim(c_indx): C x 1 x 1 x 1 | .
-               fn = dist.Categorical(
+               fn = dist.OneHotCategorical(
                   cell_type_probs # dim: ncells x 1 | C
                ),
                infer={ "enumerate": "parallel" },
@@ -222,7 +217,7 @@ class Stadacone(torch.nn.Module):
       self.ctype, self.batch, self.group, self.label, self.X, masks = data
       self.cmask, self.lmask, self.gmask = masks
    
-      self.ctype = self.ctype.view(-1,1)
+      self.ctype = F.one_hot(self.ctype.view(-1,1), num_classes=C).float()
       self.cmask = self.cmask.view(-1,1)
       self.lmask = self.lmask.view(-1,1)
    
@@ -238,8 +233,6 @@ class Stadacone(torch.nn.Module):
       # Define and register encoders.
       self.cell_type_encoder = CellTypeEncoder(G,C).to(self.device)
       self.shift_encoder = ShiftEncoder(G).to(self.device)
-#      pyro.module("cell_type_encoder", self.cell_type_encoder)
-#      pyro.module("shift_encoder", self.shift_encoder)
 
       # 1a) Define core parts of the model.
       self.output_scale_tril_unit = self.sample_scale_tril_unit
@@ -432,8 +425,8 @@ class Stadacone(torch.nn.Module):
    def sample_c_indx(self, ctype_i, ctype_i_mask):
       c_indx = pyro.sample(
             name = "cell_type",
-            # dim(c_indx): C x 1 x ncells x 1 | .
-            fn = dist.Categorical(
+            # dim(c_indx): C x 1 x ncells x 1 | C
+            fn = dist.OneHotCategorical(
                torch.ones(1,1,C).to(device),
             ),
             obs = ctype_i,
@@ -441,10 +434,8 @@ class Stadacone(torch.nn.Module):
       )
       return c_indx
 
-   def subset_c_indx(self, ctype, cmask, indx_n):
-      # dim(c_indx): ncells x 1
-      c_indx = subset(ctype, indx_n)
-      return c_indx
+   def subset_c_indx(self, ctype_i, cmask_i_mask):
+      return ctype_i
 
    def sample_theta_n(self, lab, lmask, indx_n):
       log_theta_n = pyro.sample(
@@ -473,19 +464,17 @@ class Stadacone(torch.nn.Module):
       return shift_n
 
    def compute_base_n_enum(self, c_indx, base):
-      # dim(ohc): ncells x C  //  C x ncells x C
-      ohc = F.one_hot(c_indx.squeeze(), num_classes=C).float()
       # dim(ohc): z x ncells x C (z = 1 or C)
-      ohc = ohc.view((-1,) + ohc.shape[-2:])
+      c_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
       # dim(base_n): z x (P) x ncells x G (z = 1 or C)
-      base_n = torch.einsum("znC,...GC->z...nG", ohc, base)
+      base_n = torch.einsum("znC,...GC->z...nG", c_indx, base)
       return base_n
 
    def compute_base_n_no_enum(self, c_indx, base):
-      # dim(ohc): ncells x C
-      ohc = F.one_hot(c_indx.squeeze(), num_classes=C).float()
+      # dim(c_indx): ncells x C
+      c_indx = c_indx.squeeze(-2)
       # dim(base_n): (P) x ncells x G
-      base_n = torch.einsum("nC,...GC->...nG", ohc, base)
+      base_n = torch.einsum("nC,...GC->...nG", c_indx, base)
       return base_n
 
    def compute_batch_fx_n(self, batch, batch_fx, indx_n, dtype):
@@ -691,7 +680,7 @@ class Stadacone(torch.nn.Module):
    
          # TODO: describe prior.
 
-         # dim(c_indx): C x 1 x ncells x 1 | .  /// ncells x 1
+         # dim(c_indx): C x 1 x ncells x 1 | 10  /// ncells x 1 | C
          c_indx = self.output_c_indx(ctype_i, ctype_i_mask)
 
          # Proportion of the units in the transcriptomes.
@@ -779,18 +768,15 @@ if __name__ == "__main__":
 
    trainer = pl.Trainer(
       default_root_dir = ".",
-#      strategy = "ddp",
       strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
       precision = "32",
       devices = 1 if DEBUG else -1,
       gradient_clip_val = 1.0,
-#      accumulate_grad_batches = ACC,
       max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
       enable_model_summary = True,
       logger = pl.loggers.CSVLogger("."),
-      # Checkpointing.
       enable_checkpointing = True,
    )
 
