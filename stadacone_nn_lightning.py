@@ -272,10 +272,12 @@ class Stadacone(torch.nn.Module):
          self.need_to_infer_cell_type = False
          self.output_c_indx = self.subset_c_indx
          self.output_base_n = self.compute_base_n_no_enum
+         self.output_wiggle_n = self.compute_wiggle_n_no_enum
       else:
          self.need_to_infer_cell_type = True
          self.output_c_indx = self.sample_c_indx
          self.output_base_n = self.compute_base_n_enum
+         self.output_wiggle_n = self.compute_wiggle_n_enum
      
       if inference_mode is False:
          self.output_x_i = self.sample_rate_n
@@ -389,13 +391,11 @@ class Stadacone(torch.nn.Module):
       return base
 
    def sample_wiggle(self, loc, scale):
-      wiggle_Gx1 = pyro.sample(
-            name = "wiggle_Gx1",
-            # dim(wiggle_Gx1): (P) x G x 1
+      wiggle = pyro.sample(
+            name = "wiggle",
+            # dim(wiggle): (P) x G x C
             fn = dist.LogNormal(loc, scale),
       )
-      # dim(wiggle): (P) x 1 x G
-      wiggle = wiggle_Gx1.transpose(-1,-2)
       return wiggle
 
    def sample_batch_fx(self, scale):
@@ -464,7 +464,7 @@ class Stadacone(torch.nn.Module):
       return shift_n
 
    def compute_base_n_enum(self, c_indx, base):
-      # dim(ohc): z x ncells x C (z = 1 or C)
+      # dim(c_indx): z x ncells x C (z = 1 or C)
       c_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
       # dim(base_n): z x (P) x ncells x G (z = 1 or C)
       base_n = torch.einsum("znC,...GC->z...nG", c_indx, base)
@@ -476,6 +476,20 @@ class Stadacone(torch.nn.Module):
       # dim(base_n): (P) x ncells x G
       base_n = torch.einsum("nC,...GC->...nG", c_indx, base)
       return base_n
+
+   def compute_wiggle_n_enum(self, c_indx, wiggle):
+      # dim(c_indx): z x ncells x C (z = 1 or C)
+      c_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
+      # dim(wiggle_n): z x (P) x ncells x G (z = 1 or C)
+      wiggle_n = torch.einsum("znC,...GC->z...nG", c_indx, wiggle)
+      return wiggle_n
+
+   def compute_wiggle_n_no_enum(self, c_indx, wiggle):
+      # dim(c_indx): ncells x C
+      c_indx = c_indx.squeeze(-2)
+      # dim(base_n): (P) x ncells x G
+      wiggle_n = torch.einsum("nC,...GC->...nG", c_indx, wiggle)
+      return wiggle_n
 
    def compute_batch_fx_n(self, batch, batch_fx, indx_n, dtype):
       # dim(ohg): ncells x B
@@ -645,9 +659,6 @@ class Stadacone(torch.nn.Module):
          # describes how "fuzzy" a gene is, or on the contrary how
          # much it is determined by the cell type and its break down
          # in transcriptional units.
-
-         # dim(base): (P) x 1 x G
-         wiggle = self.output_wiggle(log_wiggle_loc, log_wiggle_scale)
    
          # Per-batch, per-gene sampling.
          with pyro.plate("GxB", B, dim=-1):
@@ -666,6 +677,14 @@ class Stadacone(torch.nn.Module):
 
             # dim(units): (P) x G x K x R
             units = self.output_units()
+   
+         # Per-cell-type, per gene sampling.
+         with pyro.plate("GxC", C, dim=-1):
+
+            # TODO: describe prior.
+
+            # dim(wiggle): (P) x G x C
+            wiggle = self.output_wiggle(log_wiggle_loc, log_wiggle_scale)
 
 
       # Per-cell sampling (on dimension -2).
@@ -710,12 +729,15 @@ class Stadacone(torch.nn.Module):
          # dim(units_n): (P) x ncells x G
          units_n = self.output_units_n(group, theta_n, units, indx_n)
 
+         # dim(wiggle_n): (P) x ncells x G
+         wiggle_n = self.output_wiggle_n(c_indx, wiggle)
+
 
          # Per-cell, per-gene sampling.
          with pyro.plate("ncellsxG", G, dim=-1):
 
             mu = base_n + batch_fx_n + units_n + shift_n
-            self.output_x_i(x_i, mu, wiggle, x_i_mask)
+            self.output_x_i(x_i, mu, wiggle_n, x_i_mask)
 
 
 if __name__ == "__main__":
