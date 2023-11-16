@@ -33,7 +33,7 @@ global G # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
-NUM_EPOCHS = 500
+NUM_EPOCHS = 1000
 
 global DEBUG_COUNTER
 DEBUG_COUNTER = 0
@@ -341,8 +341,8 @@ class Stadacone(torch.nn.Module):
             name = "log_fuzz_loc",
             # dim(log_fuzz_loc): (P x 1) x 1
             fn = dist.Normal(
-                0.5 * torch.ones(1).to(self.device),
-                0.7 * torch.ones(1).to(self.device)
+                -1.0 * torch.ones(1).to(self.device),
+                 0.5 * torch.ones(1).to(self.device)
             ),
       )
       return log_fuzz_loc
@@ -352,7 +352,7 @@ class Stadacone(torch.nn.Module):
             name = "log_fuzz_scale",
             # dim(log_fuzz_scale): (P x 1) x 1
             fn = dist.Exponential(
-                1. * torch.ones(1).to(self.device),
+                3. * torch.ones(1).to(self.device),
             ),
       )
       return log_fuzz_scale
@@ -537,13 +537,14 @@ class Stadacone(torch.nn.Module):
       return x_i
 
    def sample_log_rate_n(self, x_i, mu, w, gmask):
-      log_rate_n = pyro.sample(
-            name = "log_rate_n",
+      delta_log_rate_n = pyro.sample(
+            name = "delta_log_rate_n",
             fn = dist.Normal(
-               mu, # dim: C x (P) x ncells x G  /// (P) x ncells x G
+               torch.zeros(1,1).to(self.device),
                w,  # dim:     (P) x      1 x G
             ),
       )
+      log_rate_n = mu + delta_log_rate_n
       x_i = pyro.sample(
             name = "x_i",
             # dim(x_i): ncells x G
@@ -605,16 +606,16 @@ class Stadacone(torch.nn.Module):
 
       # The parameter `log_fuzz_loc` is the location parameter
       # for the parameter `fuzz`. The prior is Gaussian, with
-      # 90% weight in the interval (-0.7, 1.7) and since `fuzz`
+      # 90% weight in the interval (-1.8, 0.2) and since `fuzz`
       # is log-normal, its median has 90% chance of being in the
-      # interval (0.5, 5.3).
+      # interval (0.15, 0.85).
 
       # dim(log_fuzz_loc): (P x 1) x 1
       log_fuzz_loc = self.output_log_fuzz_loc()
 
       # The parameter `log_fuzz_scale` is the scale parameter
       # for the parameter `fuzz`. The prior is exponential,
-      # with 90% weight in the interval (.05, 3.00), which
+      # with 90% weight in the interval (.15, 1.00), which
       # indicates the typical dispersion of `fuzz` between
       # genes as a log-normal variable.
 
@@ -741,7 +742,7 @@ class Stadacone(torch.nn.Module):
 
       global DEBUG_COUNTER
       DEBUG_COUNTER += 1
-      if DEBUG_COUNTER > 450:
+      if DEBUG_COUNTER > 950:
          import pdb; pdb.set_trace()
       return
 
