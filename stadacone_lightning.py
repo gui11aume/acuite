@@ -49,7 +49,7 @@ def subset(tensor, idx):
 
 
 class plTrainHarness(pl.LightningModule):
-   def __init__(self, stadacone, lr=.002):
+   def __init__(self, stadacone, lr=.01):
       super().__init__()
       self.stadacone = stadacone
       self.pyro_model = stadacone.model
@@ -142,21 +142,21 @@ class cell_autoguide(AutoGuide):
             event_dim = 1
          )
       )
-      pyro.infer.autoguide.utils.deep_setattr(self,
-         "post_shift_loc",
-         pyro.nn.module.PyroParam(
-            torch.zeros(self.ncells,1).to(self.device),
-            event_dim = 0
-         )
-      )
-      pyro.infer.autoguide.utils.deep_setattr(self,
-         "post_shift_scale",
-         pyro.nn.module.PyroParam(
-            torch.ones(self.ncells,1).to(self.device),
-            constraint = torch.distributions.constraints.positive,
-            event_dim = 0
-         )
-      )
+#      pyro.infer.autoguide.utils.deep_setattr(self,
+#         "post_shift_loc",
+#         pyro.nn.module.PyroParam(
+#            -1.0 * torch.ones(self.ncells,1).to(self.device),
+#            event_dim = 0
+#         )
+#      )
+#      pyro.infer.autoguide.utils.deep_setattr(self,
+#         "post_shift_scale",
+#         pyro.nn.module.PyroParam(
+#            0.5 * torch.ones(self.ncells,1).to(self.device),
+#            constraint = torch.distributions.constraints.positive,
+#            event_dim = 0
+#         )
+#      )
 
    def forward(self, idx=None):
 
@@ -182,25 +182,25 @@ class cell_autoguide(AutoGuide):
                infer={ "enumerate": "parallel" },
             )
 
-      with ExitStack() as stack:
-         for frame in self._cond_indep_stacks["shift_n"]:
-             stack.enter_context(plates[frame.name])
-
-         # Posterior distribution of `shift_n`.
-         post_shift_loc = pyro.infer.autoguide.utils.deep_getattr(self, "post_shift_loc")
-         post_shift_scale = pyro.infer.autoguide.utils.deep_getattr(self, "post_shift_scale")
-         post_shift_n = pyro.sample(
-            name = "shift_n",
-            # dim(post_shift_n): ncells x 1
-            fn = dist.Normal(
-                post_shift_loc,   # dim: ncells x 1
-                post_shift_scale  # dim: ncells x 1
-            ),
-         )
+#      with ExitStack() as stack:
+#         for frame in self._cond_indep_stacks["shift_n"]:
+#             stack.enter_context(plates[frame.name])
+#
+#         # Posterior distribution of `shift_n`.
+#         post_shift_loc = pyro.infer.autoguide.utils.deep_getattr(self, "post_shift_loc")
+#         post_shift_scale = pyro.infer.autoguide.utils.deep_getattr(self, "post_shift_scale")
+#         post_shift_n = pyro.sample(
+#            name = "shift_n",
+#            # dim(post_shift_n): ncells x 1
+#            fn = dist.Normal(
+#                post_shift_loc,   # dim: ncells x 1
+#                post_shift_scale  # dim: ncells x 1
+#            ),
+#         )
 
       dictionary = {
           "cell_type_unobserved": post_c_indx,
-          "shift_n": post_shift_n,
+#          "shift_n": post_shift_n,
       }
 
       return dictionary
@@ -208,7 +208,7 @@ class cell_autoguide(AutoGuide):
 
 class Stadacone(torch.nn.Module):
 
-   def __init__(self, data, amortize = True):
+   def __init__(self, data, marginalize = True):
       super().__init__()
 
       # Unpack data.
@@ -264,24 +264,26 @@ class Stadacone(torch.nn.Module):
 
       if cmask.all():
          self.need_to_infer_cell_type = False
-         self.output_c_indx = self.subset_c_indx
+         self.output_c_indx = self.return_ctype_as_is
          self.output_base_n = self.compute_base_n_no_enum
       else:
          self.need_to_infer_cell_type = True
          self.output_c_indx = self.sample_c_indx
          self.output_base_n = self.compute_base_n_enum
      
-      if amortize is False:
+      if marginalize is False:
          self.output_x_i = self.sample_log_rate_n
       
       # 2) Define the guide.
       self.guide = AutoGuideList(self.model, create_plates=self.create_ncells_plate)
       self.guide.append(AutoNormal(
-          pyro.poutine.block(self.model, hide = ["cell_type_unobserved", "shift_n"])
+#          pyro.poutine.block(self.model, hide = ["cell_type_unobserved", "shift_n"])
+          pyro.poutine.block(self.model, hide = ["cell_type_unobserved"])
       ))
       if self.need_to_infer_cell_type:
          self.guide.append(cell_autoguide(
-                pyro.poutine.block(self.model, expose = ["cell_type_unobserved", "shift_n"]),
+#                pyro.poutine.block(self.model, expose = ["cell_type_unobserved", "shift_n"]),
+                pyro.poutine.block(self.model, expose = ["cell_type_unobserved"]),
                 device = self.device,
                 X = self.X,
                 ncells = self.ncells,
@@ -424,7 +426,7 @@ class Stadacone(torch.nn.Module):
       )
       return c_indx
 
-   def subset_c_indx(self, ctype_i, cmask_i_mask):
+   def return_ctype_as_is(self, ctype_i, cmask_i_mask):
       return ctype_i
 
    def sample_theta_n(self, lab, lmask, indx_n):
@@ -481,7 +483,7 @@ class Stadacone(torch.nn.Module):
       units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
       return units_n
 
-   def compute_ELBO_rate_n(self, x_i, mu, sg, *args, **kwargs):
+   def compute_ELBO_rate_n(self, x_i, mu, sg, x_i_mask, idx, *args, **kwargs):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
       # LogNormal distribution. The variational posterior parameters
       # given the observations `x_i` are `mu_i` and `w2_i`. In this case
@@ -490,39 +492,49 @@ class Stadacone(torch.nn.Module):
       # This allows us to compute the ELBO efficiently without having
       # to store parameters and gradients for `mu_i` and `w2_i`.
    
+      if "AutoGuideList.1.post_c_indx_probs" not in pyro.get_param_store():
+          return 
+      prob = pyro.param("AutoGuideList.1.post_c_indx_probs").detach()
+      prob_n = prob[idx,0,:]
       # Fix parameters by detaching gradient.
       m = mu.detach()
       w2 = torch.square(sg.detach())
-      # Initialize `mu_i`.
-      mu_i = (x_i * w2 - 1) * torch.ones_like(m)
-      # Perform 5 Newton-Raphson iterations.
-      for _ in range(5):
-         f = m + mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2)
+      # Initialize `mu_i` with dim: (P) x ncells x G.
+      mu_i = (x_i * w2 - 3.) * torch.ones(m.shape[-3:]).to(self.device)
+      logC = torch.logsumexp(m + prob_n.view(C,1,-1,1).log(), dim=0)
+      # Perform 15 Newton-Raphson iterations.
+      for _ in range(15):
+         f = mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2) + logC
          df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
          mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - .01)
 
-      # Compute df/dsg for the target gradient and set a
+      # Compute the target gradient and set a
       # new variable with the correct gradient.
-      sg_term = .5 * (1 - mu_i) / torch.square(w2 * x_i + 1 - mu_i) - mu_i / w2 / (w2 * x_i - mu_i)
-      target_grad = torch.clamp(- mu * 1 / df - torch.square(sg) * sg_term / df, min = 1., max = 1.)
+      s2 = torch.square(sg)
+      prob = pyro.param("AutoGuideList.1.post_c_indx_probs")[idx,0,:]
+      logC = torch.logsumexp(mu + prob_n.view(C,1,-1,1).log(), dim=0)
+      f = mu_i + s2 * .5 / (s2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / s2) + logC
+      df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
 
-      mu_i_ = mu_i + target_grad - target_grad.detach()
+      will_give_target_grad = -f / df
+      mu_i_ = mu_i + will_give_target_grad - will_give_target_grad.detach()
 
       # Set the optimal `w2_i` from the optimal `mu_i`.
-      w2_i_ = 1. / (x_i + (1 - mu_i_) / torch.square(sg))
+      w2_i_ = s2 / (s2 * x_i + 1 - mu_i_)
    
       # Compute ELBO term as a function of `mu` and `sg`,
       # for which we kept the gradient.
-      mini_ELBO = - torch.exp(mu + mu_i_ + 0.5 * w2_i_)      \
-                  + (x_i * mu) - torch.log(sg)               \
+      def mini_ELBO_fn(mu, sg, mu_i_, w2_i_):
+         return - torch.exp(mu + mu_i_ + 0.5 * w2_i_)  \
+                  + x_i * (mu + mu_i_) - torch.log(sg) \
+                  + 0.5 * torch.log(w2_i_)             \
                   - 0.5 * (mu_i_ * mu_i_ + w2_i_) / (sg * sg)
+      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i_, w2_i_)
    
       pyro.factor("PLN_ELBO_term", mini_ELBO)
       return x_i
 
-   def sample_log_rate_n(self, x_i, mu, gene_fuzz, gmask):
-      # dim(gene_fuzz): (P) x 1 x G
-      gene_fuzz = gene_fuzz.transpose(-1,-2)
+   def sample_log_rate_n(self, x_i, mu, gene_fuzz, gmask, idx=None):
       delta_log_rate_n = pyro.sample(
             name = "delta_log_rate_n",
             # dim(delta_log_rate_n): (P) x ncells x G
@@ -532,12 +544,12 @@ class Stadacone(torch.nn.Module):
             ),
       )
       # dim(log_rate_n): C x (P) x ncells x G
-      log_rate_n = mu + delta_log_rate_n
+      rate_n = torch.clamp(torch.exp(mu + delta_log_rate_n), max=1e6)
       x_i = pyro.sample(
             name = "x_i",
             # dim(x_i): ncells x G
             fn = dist.Poisson(
-               torch.exp(log_rate_n) # dim: C x (P) x ncells x G
+               rate = rate_n # dim: C x (P) x ncells x G
             ),
             obs = x_i,
             obs_mask = gmask
@@ -717,8 +729,11 @@ class Stadacone(torch.nn.Module):
          # Per-cell, per-gene sampling.
          with pyro.plate("ncellsxG", G, dim=-1):
 
+            # dim(mu_n): C x (P) x ncells x G
             mu_n = base_n + batch_fx_n + units_n + shift_n
-            self.output_x_i(x_i, mu_n, gene_fuzz, x_i_mask)
+            # dim(gene_fuzz): (P) x 1 x G
+            gene_fuzz = gene_fuzz.transpose(-1,-2)
+            self.output_x_i(x_i, mu_n, gene_fuzz, x_i_mask, indx_n)
 
       global DEBUG_COUNTER
       DEBUG_COUNTER += 1
@@ -782,7 +797,7 @@ if __name__ == "__main__":
 
 
    pyro.clear_param_store()
-   stadacone = Stadacone(data, amortize=False)
+   stadacone = Stadacone(data, marginalize=False)
    harnessed = plTrainHarness(stadacone)
 
    trainer = pl.Trainer(
