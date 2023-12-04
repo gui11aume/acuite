@@ -148,7 +148,7 @@ class Stadacone(torch.nn.Module):
       self.output_gene_fuzz = self.sample_gene_fuzz
       self.output_base = self.sample_base
       self.output_shift_n = self.sample_shift_n
-      # self.output_x_i = self.compute_ELBO_rate_n
+      self.output_x_i = self.compute_ELBO_rate_n
 
       # 1b) Define optional parts of the model.
       if K > 1:
@@ -385,68 +385,63 @@ class Stadacone(torch.nn.Module):
       units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
       return units_n
 
-#   def compute_ELBO_rate_n(self, x_i, mu, sg, x_i_mask, idx, *args, **kwargs):
-#      # Parameters `mu` and `sg` are the prior parameters of the Poisson
-#      # LogNormal distribution. The variational posterior parameters
-#      # given the observations `x_i` are `mu_i` and `w2_i`. In this case
-#      # we can compute the ELBO analytically and maximize it with respect
-#      # to `mu_i` and `w2_i` so as to pass the gradient to `mu` and `sg`.
-#      # This allows us to compute the ELBO efficiently without having
-#      # to store parameters and gradients for `mu_i` and `w2_i`.
-#   
-#      if "AutoGuideList.1.post_c_indx_probs" not in pyro.get_param_store():
-#         return
-#      probs = pyro.param("AutoGuideList.1.post_c_indx_probs").detach()
-#      probs_n = probs[idx,0,:].transpose(-1,-2).view(C,1,-1,1)
-#
-#      # Fix parameters by detaching gradient.
-#      m = mu.detach()
-#      w2 = torch.square(sg.detach())
-#      # Initialize `mu_i` with dim: (P) x ncells x G.
-#      mu_i = (x_i * w2 - 3.) * torch.ones(m.shape[-3:]).to(self.device)
-#      logC = torch.logsumexp(m + probs_n.log(), dim=0)
-#      # Perform 5 Newton-Raphson iterations.
-#      for _ in range(5):
-##         f = m + mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2)
+   def compute_ELBO_rate_n(self, x_i, mu, sg, probs_n, x_i_mask, idx):
+      # Parameters `mu` and `sg` are the prior parameters of the Poisson
+      # LogNormal distribution. The variational posterior parameters
+      # given the observations `x_i` are `mu_i` and `w2_i`. In this case
+      # we can compute the ELBO analytically and maximize it with respect
+      # to `mu_i` and `w2_i` so as to pass the gradient to `mu` and `sg`.
+      # This allows us to compute the ELBO efficiently without having
+      # to store parameters and gradients for `mu_i` and `w2_i`.
+
+      # FIXME: compute something during prototyping.
+      if mu.dim() < 4: return
+
+      # Detach gradient from input parameters.
+      m = mu.detach()
+      w2 = torch.square(sg.detach())
+      # Initialize `mu_i` with dim: (P) x ncells x G.
+      mu_i = (x_i * w2 - 3.) * torch.ones(m.shape[-3:]).to(self.device)
+      # dim(log_p): C x (P) x ncells x 1
+#      logP = probs_n.detach().permute(-1,0,1,2).log()
+      # dim(logC): (P) x ncells x G
+#      logC = torch.logsumexp(m + logP, dim=0)
+      # Perform 5 Newton-Raphson iterations.
+      for _ in range(5):
+         f = m + mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2)
 #         f = mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2) + logC
-#         df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
-#         mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - .01)
-#
-#      # Compute the target gradient and set a
-#      # new variable with the correct gradient.
-#      s2 = torch.square(sg)
-##      probs = pyro.param("AutoGuideList.1.post_c_indx_probs")
-##      probs_n = probs[idx,0,:].transpose(-1,-2).view(C,1,-1,1)
-#      logC = torch.logsumexp(mu + probs_n.log(), dim=0)
-##      f = mu + mu_i + s2 * .5 / (s2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / s2)
+         df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
+         mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - .01)
+
+      # Compute the target gradient and set a
+      # new variable with the correct gradient.
+      s2 = torch.square(sg)
+#      probs = pyro.param("AutoGuideList.1.post_c_indx_probs")
+#      probs_n = probs[idx,0,:].transpose(-1,-2).view(C,1,-1,1)
+#      logC = torch.logsumexp(mu + probs_n.permute(-1,0,1,2).log(), dim=0)
+#      f = mu + mu_i + s2 * .5 / (s2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / s2)
 #      f = mu_i + s2 * .5 / (s2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / s2) + logC
-##      df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
-#
-#      will_give_target_grad = f / df
+#      df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
+
+#      will_give_target_grad = -f / df
 #      mu_i_ = mu_i + will_give_target_grad - will_give_target_grad.detach()
-#
-#      # Set the optimal `w2_i` from the optimal `mu_i`.
-#      w2_i_ = s2 / (s2 * x_i + 1 - mu_i_)
-#
-###      if mu_i_.requires_grad:
-###          # mu_i_.register_hook(lambda grad: print(grad[:,0,7271]))
-###          # sg.register_hook(lambda grad: print((grad[:,:,:] != 0).sum()))
-###          # sg.register_hook(lambda grad: print(grad[:,0,3]))
-###          # mu_i_[1,2,3].backward()
-###          pass
-#
-#      # Compute ELBO term as a function of `mu` and `sg`,
-#      # for which we kept the gradient.
-#      def mini_ELBO_fn(mu, sg, mu_i_, w2_i_):
-#         return - torch.exp(mu + mu_i_ + 0.5 * w2_i_)  \
-#                  + x_i * (mu + mu_i_) - torch.log(sg) \
-#                  + 0.5 * torch.log(w2_i_)             \
-#                  - 0.5 * (mu_i_ * mu_i_ + w2_i_) / (sg * sg) \
+
+      # Set the optimal `w2_i` from the optimal `mu_i`.
+      mu_i_ = mu_i
+      w2_i_ = s2 / (s2 * x_i + 1 - mu_i_)
+
+      # Compute ELBO term as a function of `mu` and `sg`,
+      # for which we kept the gradient.
+      def mini_ELBO_fn(mu, sg, mu_i_, w2_i_):
+         return - torch.exp(mu + mu_i_ + 0.5 * w2_i_)  \
+                  + x_i * (mu + mu_i_) - torch.log(sg) \
+                  + 0.5 * torch.log(w2_i_)             \
+                  - 0.5 * (mu_i_ * mu_i_ + w2_i_) / (sg * sg) \
 #                  - torch.lgamma(x_i+1) + .5
-#      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i_, w2_i_)
-#   
-#      pyro.factor("PLN_ELBO_term", mini_ELBO)
-#      return x_i
+      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i_, w2_i_)
+   
+      pyro.factor("PLN_ELBO_term", mini_ELBO)
+      return x_i
 
    def sample_log_rate_n(self, x_i, mu, gene_fuzz, gmask, idx=None):
       delta_log_rate_n = pyro.sample(
@@ -659,7 +654,7 @@ class Stadacone(torch.nn.Module):
             mu_n = base_n + batch_fx_n + units_n + shift_n
             # dim(gene_fuzz): (P) x 1 x G
             gene_fuzz = gene_fuzz.transpose(-1,-2)
-            self.output_x_i(x_i, mu_n, gene_fuzz, x_i_mask, indx_n)
+            self.output_x_i(x_i, mu_n, gene_fuzz, probs_n, x_i_mask, indx_n)
 
 
 
@@ -718,7 +713,7 @@ if __name__ == "__main__":
 
 
    pyro.clear_param_store()
-   stadacone = Stadacone(data, marginalize_rate_n=False)
+   stadacone = Stadacone(data, marginalize_rate_n=True)
    harnessed = plTrainHarness(stadacone)
 
    trainer = pl.Trainer(
