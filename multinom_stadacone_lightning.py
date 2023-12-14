@@ -33,7 +33,7 @@ global G # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 256
 NUM_PARTICLES = 12
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 2000
 
 global DEBUG_COUNTER
 DEBUG_COUNTER = 0
@@ -145,16 +145,16 @@ class cell_autoguide(AutoGuide):
       pyro.infer.autoguide.utils.deep_setattr(self,
          "post_logits_n_loc",
          pyro.nn.module.PyroParam(
-            torch.ones(C,1,G,self.ncells).to(self.device),
-            event_dim = 0
+            torch.ones(C,1,1,self.ncells,G).to(self.device),
+            event_dim = 1
          )
       )
       pyro.infer.autoguide.utils.deep_setattr(self,
          "post_logits_n_scale",
          pyro.nn.module.PyroParam(
-            torch.ones(C,1,G,self.ncells).to(self.device),
+            torch.ones(C,1,1,self.ncells,G).to(self.device),
             constraint = torch.distributions.constraints.positive,
-            event_dim = 0
+            event_dim = 1
          )
       )
 
@@ -195,7 +195,7 @@ class cell_autoguide(AutoGuide):
                fn = dist.Normal(
                   post_logits_n_loc,
                   post_logits_n_scale,
-               ),
+               ).to_event(1),
          )
 
       dictionary = {
@@ -593,6 +593,17 @@ class Stadacone(torch.nn.Module):
             # dim(units): (P) x G x K x R
             units = self.output_units()
 
+         with pyro.plate("8xG", 8, dim=-2):
+            
+            cov_factor = pyro.sample(
+                    "cov_factor",
+                    # dim(cov_factor): (P) x 8 x G
+                    dist.Normal(
+                        torch.zeros(1,1).to(self.device),
+                        torch.ones(1,1).to(self.device),
+                    )
+            )
+
 
       # Per-cell sampling.
       with pyro.plate("ncells", self.ncells, dim=-1,
@@ -630,21 +641,30 @@ class Stadacone(torch.nn.Module):
          # dim(mu_n): C x (P) x ncells x G
          mu_n = base_n + batch_fx_n + units_n
 
+#         # Per-cell, per-gene sampling.
+#         with pyro.plate("Gxncells", G, dim=-2):
+#
+#            fuzz = fuzz.transpose(-1,-2)
+#            logits_n = pyro.sample(
+#                  name = "logits_n",
+#                  fn = dist.Normal(
+#                     mu_n, # dim: C x (P) x G x ncells
+#                     fuzz, # dim:     (P) x G x 1
+#                  ),
+#            )
 
-         # Per-cell, per-gene sampling.
-         with pyro.plate("Gxncells", G, dim=-2):
-
-            fuzz = fuzz.transpose(-1,-2)
-            logits_n = pyro.sample(
-                  name = "logits_n",
-                  fn = dist.Normal(
-                     mu_n, # dim: C x (P) x G x ncells
-                     fuzz, # dim:     (P) x G x 1
-                  ),
-            )
-
-         # dim(logits_n): C x (P) x 1 x ncells x G
-         logits_n = logits_n.transpose(-1,-2).unsqueeze(-3)
+         mu_n = mu_n.transpose(-1,-2).unsqueeze(-3)
+         cov_factor = cov_factor.transpose(-1,-2).unsqueeze(-3).unsqueeze(-3)
+         fuzz = fuzz.unsqueeze(-3)
+         logits_n = pyro.sample(
+               name = "logits_n",
+               # dim(logits_n): C x (P) x 1 x ncells | G
+               fn = dist.LowRankMultivariateNormal(
+                  loc = mu_n,              # dim: C x (P) x 1 x ncells x G
+                  cov_factor = cov_factor, # dim:     (P) x 1 x 1      x G x 2
+                  cov_diag = fuzz,         # dim:     (P) x 1 x 1      x G
+               ),
+         )
 
          pyro.sample(
                name = "x_i",
@@ -659,7 +679,7 @@ class Stadacone(torch.nn.Module):
 
       global DEBUG_COUNTER
       DEBUG_COUNTER += 1
-      if DEBUG_COUNTER > 950:
+      if DEBUG_COUNTER > 1950:
          import pdb; pdb.set_trace()
       return x_i
 
