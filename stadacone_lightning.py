@@ -33,7 +33,7 @@ global G # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 64
 
 global DEBUG_COUNTER
 DEBUG_COUNTER = 0
@@ -108,8 +108,7 @@ class plTrainHarness(pl.LightningModule):
       return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
    
    def training_step(self, batch, batch_idx):
-      idx = batch.sort().values
-      loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, idx)
+      loss = self.elbo.differentiable_loss(self.pyro_model, self.pyro_guide, batch)
       (lr,) = self.lr_schedulers().get_last_lr()
       info = { "loss": loss, "lr": lr }
       self.log_dict(dictionary=info, on_step=True, prog_bar=True, logger=True)
@@ -385,7 +384,7 @@ class Stadacone(torch.nn.Module):
       units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
       return units_n
 
-   def compute_ELBO_rate_n(self, x_i, mu, sg, probs_n, x_i_mask, idx):
+   def compute_ELBO_rate_n(self, x_i, mu, sg, x_i_mask, idx):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
       # LogNormal distribution. The variational posterior parameters
       # given the observations `x_i` are `mu_i` and `w2_i`. In this case
@@ -410,17 +409,17 @@ class Stadacone(torch.nn.Module):
 
       # Set the optimal `w2_i` from the optimal `mu_i`.
       s2 = torch.square(sg)
-      w2_i_ = s2 / (s2 * x_i + 1 - mu_i_)
+      w2_i = s2 / (s2 * x_i + 1 - mu_i)
 
       # Compute ELBO term as a function of `mu` and `sg`,
       # for which we kept the gradient.
-      def mini_ELBO_fn(mu, sg, mu_i_, w2_i_):
-         return - torch.exp(mu + mu_i_ + 0.5 * w2_i_)  \
-                  + x_i * (mu + mu_i_) - torch.log(sg) \
-                  + 0.5 * torch.log(w2_i_)             \
-                  - 0.5 * (mu_i_ * mu_i_ + w2_i_) / (sg * sg) \
+      def mini_ELBO_fn(mu, sg, mu_i, w2_i):
+         return - torch.exp(mu + mu_i + 0.5 * w2_i)  \
+                  + x_i * (mu + mu_i) - torch.log(sg) \
+                  + 0.5 * torch.log(w2_i)             \
+                  - 0.5 * (mu_i * mu_i + w2_i) / (sg * sg) \
 #                  - torch.lgamma(x_i+1) + .5
-      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i_, w2_i_)
+      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i, w2_i)
    
       pyro.factor("PLN_ELBO_term", mini_ELBO)
       return x_i
@@ -636,7 +635,7 @@ class Stadacone(torch.nn.Module):
             mu_n = base_n + batch_fx_n + units_n + shift_n
             # dim(gene_fuzz): (P) x 1 x G
             gene_fuzz = gene_fuzz.transpose(-1,-2)
-            self.output_x_i(x_i, mu_n, gene_fuzz, probs_n, x_i_mask, indx_n)
+            self.output_x_i(x_i, mu_n, gene_fuzz, x_i_mask, indx_n)
 
 
 
@@ -664,11 +663,6 @@ if __name__ == "__main__":
    cmask = info[4].to(device)
 
    X = torch.load(expr_path)
-   # XXX #
-   idx = torch.randperm(int(X.shape[0]))[:500].sort().values
-   idx = torch.cat([torch.arange(10), idx[10:]])
-   X = subset(X, idx).to(device)
-
    lmask = torch.zeros(X.shape[0], dtype=torch.bool).to(device)
 
    # Set the dimensions.
@@ -676,13 +670,6 @@ if __name__ == "__main__":
    C = int(ctype.max() + 1)
    R = int(group.max() + 1)
    G = int(X.shape[-1])
-
-   # XXX #
-   ctype = ctype[idx]
-   batch = batch[idx]
-   group = group[idx]
-   label = label[idx]
-   cmask = cmask[idx]
 
    data = (ctype, batch, group, label, X, (cmask, lmask, None))
    data_idx = range(X.shape[0])
@@ -703,7 +690,7 @@ if __name__ == "__main__":
       strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
       precision = "32",
-      devices = 1 if DEBUG else -1,
+      devices = [0],
       gradient_clip_val = 1.0,
       max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
