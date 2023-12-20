@@ -31,9 +31,9 @@ global G # Number of genes / from data.
 
 
 DEBUG = False
-SUBSMPL = 256
-NUM_PARTICLES = 16
-NUM_EPOCHS = 512
+SUBSMPL = 512
+NUM_PARTICLES = 12
+NUM_EPOCHS = 768
 
 DEBUG_COUNTER = 0
 
@@ -559,20 +559,17 @@ class Stadacone(pyro.nn.PyroModule):
          # dim(base): (P) G x 1 | C
          base = self.output_base(global_base, scale_tril)
    
-         # Per-batch, per-gene sampling.
-         with pyro.plate("GxC", C, dim=-1):
-
-            # The parameter `gene_fuzz` is the standard deviation
-            # for genes in the transcriptome. The prior is log-normal
-            # with location parameter `log_fuzz_loc` and scale
-            # parameter `log_fuzz_scale`. For every gene, the
-            # standard deviation is applied to all the cells, so it
-            # describes how "fuzzy" a gene is, or on the contrary how
-            # much it is determined by the cell type and its break down
-            # in transcriptional units.
+         # The parameter `gene_fuzz` is the standard deviation
+         # for genes in the transcriptome. The prior is log-normal
+         # with location parameter `log_fuzz_loc` and scale
+         # parameter `log_fuzz_scale`. For every gene, the
+         # standard deviation is applied to all the cells, so it
+         # describes how "fuzzy" a gene is, or on the contrary how
+         # much it is determined by the cell type and its break down
+         # in transcriptional units.
       
-            # dim(fuzz): (P) x G x C
-            gene_fuzz = self.output_gene_fuzz(log_fuzz_loc, log_fuzz_scale)
+         # dim(fuzz): (P) x G x 1
+         gene_fuzz = self.output_gene_fuzz(log_fuzz_loc, log_fuzz_scale)
    
          # Per-batch, per-gene sampling.
          with pyro.plate("GxB", B, dim=-1):
@@ -635,10 +632,10 @@ class Stadacone(pyro.nn.PyroModule):
          # dim(units_n): (P) x ncells x G
          units_n = self.output_units_n(group, theta_n, units, indx_n)
 
-         # dim(c_indx): z x ncells x C (z = 1 or C)
-         cc_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
-         # dim(gene_fuzz_n): C x (P) x ncells x G
-         gene_fuzz_n = torch.einsum("znC,...GC->z...nG", cc_indx, gene_fuzz)
+#         # dim(c_indx): z x ncells x C (z = 1 or C)
+#         cc_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
+#         # dim(gene_fuzz_n): C x (P) x ncells x G
+#         gene_fuzz_n = torch.einsum("znC,...GC->z...nG", cc_indx, gene_fuzz)
 
 
          # Per-cell, per-gene sampling.
@@ -654,23 +651,19 @@ class Stadacone(pyro.nn.PyroModule):
                # dim(logits_n): ncells x G
                fn = dist.Normal(
                   torch.zeros(1,1).to(self.device),
-                  gene_fuzz_n, # C x (P) x ncells x G
+                  gene_fuzz.transpose(-1,-2),
                )
             )
-
-         # dim(logits_n): C x (P) x 1 x ncells x G
-         logits_n = logits_n.unsqueeze(-2)
 
          pyro.sample(
             name = "x_i",
             # dim(x_i): ncells | G
             fn = dist.Multinomial(
-               logits = logits_n + base_n.unsqueeze(-2),
+               logits = (logits_n + base_n).unsqueeze(-2),
                validate_args = False,
             ),  
             obs = x_i.unsqueeze(-2),
          ) 
-      import pdb; pdb.set_trace()
 #      global DEBUG_COUNTER
 #      DEBUG_COUNTER += 1
 #      if DEBUG_COUNTER > 4 * 512:
@@ -749,6 +742,16 @@ if __name__ == "__main__":
    # XXX #
    idx = torch.randperm(int(X.shape[0]))[:2048].sort().values
    X = subset(X, idx).to(device)
+
+#   XX = X.to_dense().to(torch.float32)
+#   totals = torch.zeros(C,G).to(torch.float32, "cuda")
+#   index = ctype.unsqueeze(-1).expand(XX.shape).to("cuda")
+#   totals.scatter_reduce_(dim=0, index=index, src=XX, reduce="sum")
+#   probs = (totals + 1e-3) / (totals + 1e-3).sum(dim=-1).unsqueeze(dim=-1)
+#   log_probs = probs.log()
+#   all_prod = XX.unsqueeze(-3) * log_probs.unsqueeze(-2)
+#   all_prod_sum = all_prod.sum(-1)
+#   outcome = all_prod_sum.max(dim=0).indices
 
    lmask = torch.zeros(X.shape[0], dtype=torch.bool).to(device)
 
