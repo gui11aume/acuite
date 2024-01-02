@@ -119,7 +119,7 @@ class plTrainHarness(pl.LightningModule):
 
 class Stadacone(pyro.nn.PyroModule):
 
-   def __init__(self, data, marginalize_rate_n=True):
+   def __init__(self, data, marginalize=True):
       super().__init__()
 
       # Unpack data.
@@ -148,46 +148,46 @@ class Stadacone(pyro.nn.PyroModule):
       self.output_global_base = self.sample_global_base
       self.output_gene_fuzz = self.sample_gene_fuzz
       self.output_base = self.sample_base
-      self.output_x_i = self.compute_ELBO_rate_n
+      self.output_x_i = self.compute_ELBO_logits_i
 
       # 1b) Define optional parts of the model.
       if K > 1:
          self.need_to_infer_units = True
          self.output_units = self.sample_units
-         self.output_theta_n = self.sample_theta_n
-         self.output_units_n = self.compute_units_n
+         self.output_theta_i = self.sample_theta_i
+         self.output_units_i = self.compute_units_i
       else:
          self.need_to_infer_units = False
          self.output_units = self.zero
-         self.output_theta_n = self.zero
-         self.output_units_n = self.zero
+         self.output_theta_i = self.zero
+         self.output_units_i = self.zero
 
       if B > 1:
          self.need_to_infer_batch_fx = True
          self.output_batch_fx_scale = self.sample_batch_fx_scale
          self.output_batch_fx = self.sample_batch_fx
-         self.output_batch_fx_n = self.compute_batch_fx_n
+         self.output_batch_fx_i = self.compute_batch_fx_i
       else:
          self.need_to_infer_batch_fx = False
          self.output_batch_fx_scale = self.zero
          self.output_batch_fx = self.zero
-         self.output_batch_fx_n = self.zero
+         self.output_batch_fx_i = self.zero
 
       if cmask.all():
          self.need_to_infer_cell_type = False
          self.output_c_indx = self.return_ctype_as_is
-         self.output_base_n = self.compute_base_n_no_enum
+         self.output_base_i = self.compute_base_i_no_enum
       else:
          self.need_to_infer_cell_type = True
          self.output_c_indx = self.sample_c_indx
-         self.output_base_n = self.compute_base_n_enum
+         self.output_base_i = self.compute_base_i_enum
      
-      if marginalize_rate_n is False:
-         self.output_x_i = self.sample_log_rate_n
+      if marginalize is False:
+         self.output_x_i = self.sample_log_rate_i
 
       # 2) Define the autoguide.
       self.autonormal = AutoNormal(pyro.poutine.block(
-         self.model, hide = ["cell_type_unobserved", "logits_n"]
+         self.model, hide = ["cell_type_unobserved", "logits_i"]
       ))
 
       # 3) Define the guide parameters.
@@ -197,11 +197,11 @@ class Stadacone(pyro.nn.PyroModule):
          constraint = torch.distributions.constraints.simplex,
          event_dim = 1
       )
-      self.param.logits_n_loc = pyro.nn.module.PyroParam(
+      self.param.logits_i_loc = pyro.nn.module.PyroParam(
          torch.zeros(self.ncells,G).to(self.device),
          event_dim = 0
       )
-      self.param.logits_n_scale = pyro.nn.module.PyroParam(
+      self.param.logits_i_scale = pyro.nn.module.PyroParam(
          torch.ones(self.ncells,G).to(self.device),
          constraint = torch.distributions.constraints.positive,
          event_dim = 0
@@ -211,10 +211,6 @@ class Stadacone(pyro.nn.PyroModule):
    #  == Helper functions == #
    def zero(self, *args, **kwargs):
       return 0.
-
-   def create_ncells_plate(self, idx=None):
-      return pyro.plate("ncells", self.ncells, dim=-2,
-         subsample=idx, device=self.device)
 
 
    #  ==  Model parts == #
@@ -345,50 +341,50 @@ class Stadacone(pyro.nn.PyroModule):
    def return_ctype_as_is(self, ctype_i, cmask_i_mask):
       return ctype_i
 
-   def sample_theta_n(self, lab, lmask, indx_n):
-      log_theta_n = pyro.sample(
-            name = "log_theta_n",
-            # dim(log_theta_n): (P) x ncells x 1 | K
+   def sample_theta_i(self, lab, lmask, indx_i):
+      log_theta_i = pyro.sample(
+            name = "log_theta_i",
+            # dim(log_theta_i): (P) x ncells x 1 | K
             fn = dist.Normal(
                torch.zeros(1,1,K).to(self.device),
                torch.ones(1,1,K).to(self.device)
             ).to_event(1),
-            obs = subset(self.smooth_lab, indx_n),
-            obs_mask = subset(lmask, indx_n)
+            obs = subset(self.smooth_lab, indx_i),
+            obs_mask = subset(lmask, indx_i)
       ) 
-      # dim(theta_n): (P) x ncells x 1 x K
-      theta_n = log_theta_n.softmax(dim=-1)
-      return theta_n
+      # dim(theta_i): (P) x ncells x 1 x K
+      theta_i = log_theta_i.softmax(dim=-1)
+      return theta_i
 
-   def compute_base_n_enum(self, c_indx, base):
+   def compute_base_i_enum(self, c_indx, base):
       # dim(c_indx): z x ncells x C (z = 1 or C)
       c_indx = c_indx.view((-1,) + c_indx.shape[-3:]).squeeze(-2)
-      # dim(base_n): z x (P) x ncells x G (z = 1 or C)
-      base_n = torch.einsum("znC,...GC->z...nG", c_indx, base)
-      return base_n
+      # dim(base_i): z x (P) x ncells x G (z = 1 or C)
+      base_i = torch.einsum("znC,...GC->z...nG", c_indx, base)
+      return base_i
 
-   def compute_base_n_no_enum(self, c_indx, base):
+   def compute_base_i_no_enum(self, c_indx, base):
       # dim(c_indx): ncells x C
       c_indx = c_indx.squeeze(-2)
-      # dim(base_n): (P) x ncells x G
-      base_n = torch.einsum("nC,...GC->...nG", c_indx, base)
-      return base_n
+      # dim(base_i): (P) x ncells x G
+      base_i = torch.einsum("nC,...GC->...nG", c_indx, base)
+      return base_i
 
-   def compute_batch_fx_n(self, batch, batch_fx, indx_n, dtype):
+   def compute_batch_fx_i(self, batch, batch_fx, indx_i, dtype):
       # dim(ohg): ncells x B
-      ohb = subset(F.one_hot(batch).to(dtype), indx_n)
-      # dim(batch_fx_n): (P) x ncells x G
-      batch_fx_n = torch.einsum("...GB,nB->...nG", batch_fx, ohb)
-      return batch_fx_n
+      ohb = subset(F.one_hot(batch).to(dtype), indx_i)
+      # dim(batch_fx_i): (P) x ncells x G
+      batch_fx_i = torch.einsum("...GB,nB->...nG", batch_fx, ohb)
+      return batch_fx_i
 
-   def compute_units_n(self, group, theta_n, units, indx_n):
+   def compute_units_i(self, group, theta_i, units, indx_i):
       # dim(ohg): ncells x R
-      ohg = subset(F.one_hot(group).to(units.dtype), indx_n)
-      # dim(units_n): (P) x ncells x G
-      units_n = torch.einsum("...noK,...GKR,nR->...nG", theta_n, units, ohg)
-      return units_n
+      ohg = subset(F.one_hot(group).to(units.dtype), indx_i)
+      # dim(units_i): (P) x ncells x G
+      units_i = torch.einsum("...noK,...GKR,nR->...nG", theta_i, units, ohg)
+      return units_i
 
-   def compute_ELBO_rate_n(self, x_i, mu, sg, x_i_mask, idx):
+   def compute_ELBO_logits_i(self, x_i, mu, sg, x_i_mask, idx):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
       # LogNormal distribution. The variational posterior parameters
       # given the observations `x_i` are `mu_i` and `w2_i`. In this case
@@ -440,25 +436,25 @@ class Stadacone(pyro.nn.PyroModule):
       pyro.factor("PLN_ELBO_term", mini_ELBO)
       return x_i
 
-   def sample_log_rate_n(self, x_i, mu, gene_fuzz, gmask, idx=None):
-      delta_log_rate_n = pyro.sample(
-            name = "delta_log_rate_n",
-            # dim(delta_log_rate_n): (P) x ncells x G
+   def sample_log_rate_i(self, x_i, mu, gene_fuzz, gmask, idx=None):
+      delta_log_rate_i = pyro.sample(
+            name = "delta_log_rate_i",
+            # dim(delta_log_rate_i): (P) x ncells x G
             fn = dist.Normal(
 #               torch.zeros(1,1).to(self.device),
                mu,
                gene_fuzz, # dim: (P) x 1 x G
             ),
       )
-      # dim(log_rate_n): C x (P) x ncells x G
-#      rate_n = torch.clamp(torch.exp(mu + delta_log_rate_n), max=1e6)
-      rate_n = torch.clamp(torch.exp(delta_log_rate_n), max=1e6)
+      # dim(log_rate_i): C x (P) x ncells x G
+#      rate_i = torch.clamp(torch.exp(mu + delta_log_rate_i), max=1e6)
+      rate_i = torch.clamp(torch.exp(delta_log_rate_i), max=1e6)
       x_i = pyro.sample(
 
             name = "x_i",
             # dim(x_i): ncells x G
             fn = dist.Poisson(
-               rate = rate_n # dim: C x (P) x ncells x G
+               rate = rate_i # dim: C x (P) x ncells x G
             ),
             obs = x_i,
             obs_mask = gmask
@@ -593,13 +589,13 @@ class Stadacone(pyro.nn.PyroModule):
 
       # Per-cell sampling (on dimension -2).
       with pyro.plate("ncells", self.ncells, dim=-2,
-            subsample=idx, device=self.device) as indx_n:
+            subsample=idx, device=self.device) as indx_i:
 
          # Subset data and mask.
-         ctype_i = subset(self.ctype, indx_n)
-         ctype_i_mask = subset(self.cmask, indx_n)
-         x_i = subset(self.X, indx_n).to_dense()
-         x_i_mask = subset(self.gmask, indx_n)
+         ctype_i = subset(self.ctype, indx_i)
+         ctype_i_mask = subset(self.cmask, indx_i)
+         x_i = subset(self.X, indx_i).to_dense()
+         x_i_mask = subset(self.gmask, indx_i)
    
          # Cell types as discrete indicators. The prior
          # distiribution is uniform over known cell types.
@@ -610,45 +606,45 @@ class Stadacone(pyro.nn.PyroModule):
          # Proportion of the units in the transcriptomes.
          # TODO: describe prior.
 
-         # dim(theta_n): (P) x ncells x 1 x K  ///  *
-         theta_n = self.output_theta_n(self.smooth_lab, self.lmask, indx_n)
+         # dim(theta_i): (P) x ncells x 1 x K  ///  *
+         theta_i = self.output_theta_i(self.smooth_lab, self.lmask, indx_i)
    
 
          # Deterministic functions to obtain per-cell means.
 
-         # dim(base_n): C x (P) x ncells x G  ///  (P) x ncells x G
-         base_n = self.output_base_n(c_indx, base)
+         # dim(base_i): C x (P) x ncells x G  ///  (P) x ncells x G
+         base_i = self.output_base_i(c_indx, base)
    
-         # dim(batch_fx_n): (P) x ncells x G
-         batch_fx_n = self.output_batch_fx_n(batch, batch_fx, indx_n, base.dtype)
+         # dim(batch_fx_i): (P) x ncells x G
+         batch_fx_i = self.output_batch_fx_i(batch, batch_fx, indx_i, base.dtype)
    
-         # dim(units_n): (P) x ncells x G
-         units_n = self.output_units_n(group, theta_n, units, indx_n)
+         # dim(units_i): (P) x ncells x G
+         units_i = self.output_units_i(group, theta_i, units, indx_i)
 
-#         gene_fuzz = gene_fuzz.transpose(-1,-2)
-#         self.output_x_i(x_i, base_n, gene_fuzz, x_i_mask, indx_n)
+         gene_fuzz = gene_fuzz.transpose(-1,-2)
+         self.output_x_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
 
-         # Per-cell, per-gene sampling.
-         with pyro.plate("ncellsxG", G, dim=-1):
-
-            logits_n = pyro.sample(
-               name = "logits_n",
-               # dim(logits_n): ncells x G
-               fn = dist.Normal(
-                  torch.zeros(1,1).to(self.device),
-                  gene_fuzz.transpose(-1,-2),
-               )
-            )
-
-         pyro.sample(
-            name = "x_i",
-            # dim(x_i): ncells | G
-            fn = dist.Multinomial(
-               logits = (logits_n + base_n).unsqueeze(-2),
-               validate_args = False,
-            ),  
-            obs = x_i.unsqueeze(-2),
-         ) 
+#         # Per-cell, per-gene sampling.
+#         with pyro.plate("ncellsxG", G, dim=-1):
+#
+#            logits_i = pyro.sample(
+#               name = "logits_i",
+#               # dim(logits_i): ncells x G
+#               fn = dist.Normal(
+#                  torch.zeros(1,1).to(self.device),
+#                  gene_fuzz.transpose(-1,-2),
+#               )
+#            )
+#
+#         pyro.sample(
+#            name = "x_i",
+#            # dim(x_i): ncells | G
+#            fn = dist.Multinomial(
+#               logits = (logits_i + base_i).unsqueeze(-2),
+#               validate_args = False,
+#            ),  
+#            obs = x_i.unsqueeze(-2),
+#         ) 
 
 
    #  ==  guide description == #
@@ -659,17 +655,17 @@ class Stadacone(pyro.nn.PyroModule):
 
       # Per-cell sampling (on dimension -2).
       with pyro.plate("ncells", self.ncells, dim=-2,
-            subsample=idx, device=self.device) as indx_n:
+            subsample=idx, device=self.device) as indx_i:
 
          # Subset data and mask.
-         ctype_i_mask = subset(self.cmask, indx_n)
+         ctype_i_mask = subset(self.cmask, indx_i)
 
          # TODO: find canonical way to enter context of the module.
          self._pyro_context.active += 1
 
          c_indx_probs = self.param.c_indx_probs
-         logits_n_loc = self.param.logits_n_loc
-         logits_n_scale = self.param.logits_n_scale
+         logits_i_loc = self.param.logits_i_loc
+         logits_i_scale = self.param.logits_i_scale
       
          with pyro.poutine.mask(mask=~ctype_i_mask):
 
@@ -685,13 +681,13 @@ class Stadacone(pyro.nn.PyroModule):
          # Per-cell, per-gene sampling.
          with pyro.plate("ncellsxG", G, dim=-1):
 
-            # Posterior distribution of `logits_n`.
-            post_logits_n = pyro.sample(
-                  name = "logits_n",
-                  # dim(logits_n): n x G
+            # Posterior distribution of `logits_i`.
+            post_logits_i = pyro.sample(
+                  name = "logits_i",
+                  # dim(logits_i): n x G
                   fn = dist.Normal(
-                     logits_n_loc,
-                     logits_n_scale,
+                     logits_i_loc,
+                     logits_i_scale,
                   ),
             )
 
@@ -768,14 +764,13 @@ if __name__ == "__main__":
 
 
    pyro.clear_param_store()
-   stadacone = Stadacone(data, marginalize_rate_n=True)
+   stadacone = Stadacone(data, marginalize=True)
    harnessed = plTrainHarness(stadacone)
 
    trainer = pl.Trainer(
       default_root_dir = ".",
       strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
-      precision = "32",
       gradient_clip_val = 1.0,
       max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
@@ -790,7 +785,7 @@ if __name__ == "__main__":
    oout = pyro.param("param.c_indx_probs").squeeze().max(dim=-1).indices[~cmask.cpu()]
    print(ctype[~cmask])
    print(oout)
-   print((oout == ctype[~cmask].cpu()).sum() / len(oout))
+   print((oout == ctype[~cmask]).sum() / len(oout))
 
    # Save output to file.
    param_store = pyro.get_param_store().get_state()
