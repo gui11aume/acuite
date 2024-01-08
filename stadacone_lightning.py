@@ -34,7 +34,7 @@ global G # Number of genes / from data.
 DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
-NUM_EPOCHS = 256
+NUM_EPOCHS = 16
 
 DEBUG_COUNTER = 0
 
@@ -140,6 +140,8 @@ class Stadacone(pyro.nn.PyroModule):
       oh = F.one_hot(self.label, num_classes=K).to(self.X.dtype)
       self.smooth_lab = ((.99-.01/(K-1)) * oh + .01/(K-1)).view(-1,1,K) if K > 1 else 0.
 
+      self.marginalize = marginalize
+
       # 1a) Define core parts of the model.
       self.output_scale_tril_unit = self.sample_scale_tril_unit
       self.output_scale_factor = self.sample_scale_factor
@@ -148,7 +150,6 @@ class Stadacone(pyro.nn.PyroModule):
       self.output_global_base = self.sample_global_base
       self.output_gene_fuzz = self.sample_gene_fuzz
       self.output_base = self.sample_base
-      self.output_x_i = self.compute_ELBO_logits_i
 
       # 1b) Define optional parts of the model.
       if K > 1:
@@ -182,30 +183,27 @@ class Stadacone(pyro.nn.PyroModule):
          self.output_c_indx = self.sample_c_indx
          self.output_base_i = self.compute_base_i_enum
      
-      if marginalize is False:
-         self.output_x_i = self.sample_log_rate_i
-
       # 2) Define the autoguide.
       self.autonormal = AutoNormal(pyro.poutine.block(
          self.model, hide = ["cell_type_unobserved", "logits_i"]
       ))
 
       # 3) Define the guide parameters.
-      self.param = pyro.nn.module.PyroModule()
-      self.param.c_indx_probs = pyro.nn.module.PyroParam(
+      self.c_indx_probs = pyro.nn.module.PyroParam(
          torch.ones(self.ncells,1,C).to(self.device),
          constraint = torch.distributions.constraints.simplex,
          event_dim = 1
       )
-      self.param.logits_i_loc = pyro.nn.module.PyroParam(
-         torch.zeros(self.ncells,G).to(self.device),
-         event_dim = 0
-      )
-      self.param.logits_i_scale = pyro.nn.module.PyroParam(
-         torch.ones(self.ncells,G).to(self.device),
-         constraint = torch.distributions.constraints.positive,
-         event_dim = 0
-      )
+      if self.marginalize is False:
+         self.logits_i_loc = pyro.nn.module.PyroParam(
+            torch.zeros(self.ncells,G).to(self.device),
+            event_dim = 0
+         )
+         self.logits_i_scale = pyro.nn.module.PyroParam(
+            torch.ones(self.ncells,G).to(self.device),
+            constraint = torch.distributions.constraints.positive,
+            event_dim = 0
+         )
 
 
    #  == Helper functions == #
@@ -384,82 +382,82 @@ class Stadacone(pyro.nn.PyroModule):
       units_i = torch.einsum("...noK,...GKR,nR->...nG", theta_i, units, ohg)
       return units_i
 
-   def compute_ELBO_logits_i(self, x_i, mu, sg, x_i_mask, idx):
+   def compute_ELBO_logits_i(self, x_ij, mu, sg, x_ij_mask, idx):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
       # LogNormal distribution. The variational posterior parameters
-      # given the observations `x_i` are `mu_i` and `w2_i`. In this case
+      # given the observations `x_ij` are `xi` and `w2_i`. In this case
       # we can compute the ELBO analytically and maximize it with respect
-      # to `mu_i` and `w2_i` so as to pass the gradient to `mu` and `sg`.
+      # to `xi` and `w2_i` so as to pass the gradient to `mu` and `sg`.
       # This allows us to compute the ELBO efficiently without having
-      # to store parameters and gradients for `mu_i` and `w2_i`.
+      # to store parameters and gradients for `xi` and `w2_i`.
 
       # FIXME: compute something during prototyping.
       if mu.dim() < 4: return
 
       self._pyro_context.active += 1
       # dim(c_indx_probs): ncells x 1 x C
-      c_indx_probs = self.param.c_indx_probs
+      c_indx_probs = self.c_indx_probs.detach()
       self._pyro_context.active -= 1
 
       # dim(c_indx_probs): C x 1 x ncells x 1
       log_probs = c_indx_probs.detach().permute(2,0,1).unsqueeze(-3).log()
-      log_one_over_P = math.log(mu.shape[-3])
+      log_P = math.log(mu.shape[-3])
 
-      # Detach gradient and compute constants.
-      C_ij = torch.logsumexp(mu.detach() + log_probs - log_one_over_P, dim=(-3,-4))
+      shift_i = x_ij.sum(dim=-1, keepdim=True).log() - \
+         torch.logsumexp(mu.detach() + log_probs - log_P, dim=(-1,-3,-4)).unsqueeze(-1)
+      C_ij = torch.logsumexp(mu.detach() + log_probs - log_P, dim=(-3,-4))
       # Harmonic mean of the variances.
       w2 = (1 / (1 / torch.square(sg.detach())).mean(dim=-3))
+      xlog = x_ij.sum(dim=-1, keepdim=True).log()
 
       # dim(m): C x ncells x G
-      # Initialize `mu_i` with dim: ncells x G.
-      mu_i = (x_i * w2 - 3.) * torch.ones_like(C_ij)
+      # Initialize `xi` with dim: ncells x G.
+      xi = (x_ij * w2 - 2.) * torch.ones_like(C_ij)
       # Perform 5 Newton-Raphson iterations.
-      for _ in range(5):
-         f = C_ij + mu_i + w2 * .5 / (w2 * x_i + 1 - mu_i) - torch.log(x_i - mu_i / w2)
-         df = 1 + w2 * .5 / torch.square(w2 * x_i + 1 - mu_i) + 1. / (w2 * x_i - mu_i)
-         mu_i = torch.clamp(mu_i - f / df, max = x_i * w2 - .01)
+      for _ in range(15):
+         kap = w2 * x_ij + 1 - xi
+         f = C_ij + shift_i + xi + .5 * w2 / kap - torch.log(x_ij - xi / w2)
+         df = 1 + .5 * w2 / torch.square(kap) + 1. / (w2 * x_ij - xi)
+         xi = torch.clamp(xi - f / df, max = x_ij * w2 - .01)
+         shift_i = torch.clamp(xlog - torch.logsumexp(C_ij + xi + .5 * w2 / kap, dim=-1, keepdim=True), min=-4, max=4)
 
-      # Set the optimal `w2_i` from the optimal `mu_i`.
-      w2_i = w2 / (w2 * x_i + 1 - mu_i)
+      # Set the optimal `w2_i` from the optimal `xi`.
+      w2_i = w2 / (w2 * x_ij + 1 - xi)
 
-      # Compute ELBO term as a function of `mu` and `sg`,
-      # for which we kept the gradient.
-      def mini_ELBO_fn(mu, sg, mu_i, w2_i, x_i):
-         ij_terms = x_i * (mu + mu_i) \
-               - torch.log(sg) - 0.5 * (mu_i * mu_i + w2_i) / (sg * sg)
-         Z_j = torch.logsumexp(mu + mu_i + 0.5 * w2_i, dim=-1, keepdim=True)
-         x_ = x_i.sum(dim=-1, keepdim=True)
-         return -x_ * Z_j + ij_terms.sum(dim=-1, keepdim=True)
+      # Compute ELBO term as a function of `mu` and `sg`.
+      def mini_ELBO_fn(mu, sg, xi, w2_i, x_ij, shift_i):
+         return - torch.exp(mu + shift_i + xi + .5 * w2_i) + x_ij * mu \
+               - torch.log(sg) - 0.5 * (xi * xi + w2_i) / (sg * sg)
 
-      mini_ELBO = mini_ELBO_fn(mu, sg, mu_i, w2_i, x_i)
+      mini_ELBO = mini_ELBO_fn(mu, sg, xi, w2_i, x_ij, shift_i)
    
-      pyro.factor("PLN_ELBO_term", mini_ELBO)
-      return x_i
+      pyro.factor("PLN_ELBO_term", mini_ELBO.sum(dim=-1, keepdim=True))
+      return x_ij
 
-   def sample_log_rate_i(self, x_i, mu, gene_fuzz, gmask, idx=None):
-      delta_log_rate_i = pyro.sample(
-            name = "delta_log_rate_i",
-            # dim(delta_log_rate_i): (P) x ncells x G
-            fn = dist.Normal(
-#               torch.zeros(1,1).to(self.device),
-               mu,
-               gene_fuzz, # dim: (P) x 1 x G
-            ),
-      )
-      # dim(log_rate_i): C x (P) x ncells x G
-#      rate_i = torch.clamp(torch.exp(mu + delta_log_rate_i), max=1e6)
-      rate_i = torch.clamp(torch.exp(delta_log_rate_i), max=1e6)
-      x_i = pyro.sample(
-
-            name = "x_i",
-            # dim(x_i): ncells x G
-            fn = dist.Poisson(
-               rate = rate_i # dim: C x (P) x ncells x G
-            ),
-            obs = x_i,
-            obs_mask = gmask
-      )
-      return x_i
+#   def sample_log_rate_i(self, x_i, mu, gene_fuzz, gmask, idx=None):
+#      delta_log_rate_i = pyro.sample(
+#            name = "delta_log_rate_i",
+#            # dim(delta_log_rate_i): (P) x ncells x G
+#            fn = dist.Normal(
+##               torch.zeros(1,1).to(self.device),
+#               mu,
+#               gene_fuzz, # dim: (P) x 1 x G
+#            ),
+#      )
+#      # dim(log_rate_i): C x (P) x ncells x G
+##      rate_i = torch.clamp(torch.exp(mu + delta_log_rate_i), max=1e6)
+#      rate_i = torch.clamp(torch.exp(delta_log_rate_i), max=1e6)
+#      x_i = pyro.sample(
+#
+#            name = "x_i",
+#            # dim(x_i): ncells x G
+#            fn = dist.Poisson(
+#               rate = rate_i # dim: C x (P) x ncells x G
+#            ),
+#            obs = x_i,
+#            obs_mask = gmask
+#      )
+#      return x_i
 
 
    #  ==  model description == #
@@ -621,30 +619,53 @@ class Stadacone(pyro.nn.PyroModule):
          # dim(units_i): (P) x ncells x G
          units_i = self.output_units_i(group, theta_i, units, indx_i)
 
+         # dim(fuzz): (P) x 1 x G
          gene_fuzz = gene_fuzz.transpose(-1,-2)
-         self.output_x_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
 
-#         # Per-cell, per-gene sampling.
-#         with pyro.plate("ncellsxG", G, dim=-1):
-#
-#            logits_i = pyro.sample(
-#               name = "logits_i",
-#               # dim(logits_i): ncells x G
-#               fn = dist.Normal(
-#                  torch.zeros(1,1).to(self.device),
-#                  gene_fuzz.transpose(-1,-2),
-#               )
-#            )
-#
-#         pyro.sample(
-#            name = "x_i",
-#            # dim(x_i): ncells | G
-#            fn = dist.Multinomial(
-#               logits = (logits_i + base_i).unsqueeze(-2),
-#               validate_args = False,
-#            ),  
-#            obs = x_i.unsqueeze(-2),
-#         ) 
+         if self.marginalize:
+            x_ij = self.compute_ELBO_logits_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
+            return
+
+         else:
+            # Per-cell, per-gene sampling.
+            with pyro.plate("ncellsxG", G, dim=-1):
+
+               logits_i = pyro.sample(
+                  name = "logits_i",
+                  # dim(logits_i): ncells x G
+                  fn = dist.Normal(
+                     torch.zeros(1,1).to(self.device),
+                     gene_fuzz,
+                  )
+               )
+
+            self._pyro_context.active += 1
+            # dim(c_indx_probs): ncells x 1 x C
+            c_indx_probs = self.c_indx_probs.detach()
+            self._pyro_context.active -= 1
+            # dim(c_indx_probs): C x 1 x ncells x 1
+            log_probs = c_indx_probs.detach().permute(2,0,1).unsqueeze(-3).log()
+
+            # FIXME: compute something during prototyping.
+            if base_i.dim() < 4:
+               shift_i = 0
+            else:
+               # Auto-shift.
+               shift_i = x_i.sum(dim=-1, keepdim=True).log() - \
+                  torch.logsumexp(logits_i + base_i + log_probs, dim=(-1,-4), keepdim=True)
+
+            rate_i = torch.clamp(torch.exp(logits_i + base_i + shift_i), max=1e6)
+
+            x = pyro.sample(
+               name = "x_i",
+               # dim(x_i): ncells | G
+               fn = dist.Poisson(
+                  rate = rate_i.unsqueeze(-2),
+               ).to_event(1),
+               obs = x_i.unsqueeze(-2),
+            ) 
+
+            return x
 
 
    #  ==  guide description == #
@@ -663,9 +684,7 @@ class Stadacone(pyro.nn.PyroModule):
          # TODO: find canonical way to enter context of the module.
          self._pyro_context.active += 1
 
-         c_indx_probs = self.param.c_indx_probs
-         logits_i_loc = self.param.logits_i_loc
-         logits_i_scale = self.param.logits_i_scale
+         c_indx_probs = self.c_indx_probs
       
          with pyro.poutine.mask(mask=~ctype_i_mask):
 
@@ -678,18 +697,24 @@ class Stadacone(pyro.nn.PyroModule):
                   infer={ "enumerate": "parallel" },
             )
 
-         # Per-cell, per-gene sampling.
-         with pyro.plate("ncellsxG", G, dim=-1):
+         # If `logits_i` are not marginalized, sample it.
+         if self.marginalize is False:
 
-            # Posterior distribution of `logits_i`.
-            post_logits_i = pyro.sample(
-                  name = "logits_i",
-                  # dim(logits_i): n x G
-                  fn = dist.Normal(
-                     logits_i_loc,
-                     logits_i_scale,
-                  ),
-            )
+            logits_i_loc = self.logits_i_loc
+            logits_i_scale = self.logits_i_scale
+
+            # Per-cell, per-gene sampling.
+            with pyro.plate("ncellsxG", G, dim=-1):
+
+               # Posterior distribution of `logits_i`.
+               post_logits_i = pyro.sample(
+                     name = "logits_i",
+                     # dim(logits_i): n x G
+                     fn = dist.Normal(
+                        logits_i_loc,
+                        logits_i_scale,
+                     ),
+               )
 
          self._pyro_context.active -= 1
 
@@ -699,7 +724,6 @@ if __name__ == "__main__":
 
    pl.seed_everything(123)
    pyro.set_rng_seed(123)
-   torch.manual_seed(123)
 
    torch.set_float32_matmul_precision('medium')
 
@@ -720,8 +744,9 @@ if __name__ == "__main__":
 
    X = torch.load(expr_path)
    # XXX #
-   idx = torch.randperm(int(X.shape[0]))[:2048].sort().values
-   X = subset(X, idx).to(device)
+#   idx = torch.randperm(int(X.shape[0]))[:2048].sort().values
+#   X = subset(X, idx).to(device)
+#   X = X.to(device)
 
 #   XX = X.to_dense().to(torch.float32)
 #   totals = torch.zeros(C,G).to(torch.float32, "cuda")
@@ -743,11 +768,12 @@ if __name__ == "__main__":
 
    # XXX #
    B = 1 # <=== remove batches
-   batch = torch.zeros_like(batch[idx])
-   ctype = ctype[idx]
-   group = group[idx]
-   label = label[idx]
-   cmask = cmask[idx]
+   batch = torch.zeros_like(batch)
+#   batch = torch.zeros_like(batch[idx])
+#   ctype = ctype[idx]
+#   group = group[idx]
+#   label = label[idx]
+#   cmask = cmask[idx]
 
    # XXX # Now Mask 10% of the cell types.
    zo = torch.bernoulli(.9 * torch.ones_like(cmask))
@@ -771,6 +797,7 @@ if __name__ == "__main__":
       default_root_dir = ".",
       strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
+      devices = [0],
       gradient_clip_val = 1.0,
       max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
@@ -782,10 +809,10 @@ if __name__ == "__main__":
    trainer.fit(harnessed, data_loader)
 
    # XXX # Print output.
-   oout = pyro.param("param.c_indx_probs").squeeze().max(dim=-1).indices[~cmask.cpu()]
-   print(ctype[~cmask])
+   oout = pyro.param("c_indx_probs").squeeze().max(dim=-1).indices[~cmask.cpu()]
+   print(ctype[~cmask].cpu())
    print(oout)
-   print((oout == ctype[~cmask]).sum() / len(oout))
+   print((oout.cpu() == ctype[~cmask].cpu()).sum() / len(oout))
 
    # Save output to file.
    param_store = pyro.get_param_store().get_state()
