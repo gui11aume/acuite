@@ -1,27 +1,17 @@
-import lightning.pytorch as pl
 import math
+import sys
+
+import lightning.pytorch as pl
 import pyro
 import pyro.distributions as dist
-import sys
 import torch
 import torch.nn.functional as F
-
-from pyro.distributions import constraints
 from pyro.infer.autoguide import (
-      AutoGuideList,
-      AutoGuide,
-      AutoNormal,
+   AutoNormal,
 )
 
-from contextlib import ExitStack
-
 from misc_stadacone import (
-      xSVI,
-      ZeroInflatedNegativeBinomial,
-      warmup_and_linear,
-      sc_data,
-      read_info,
-      read_sparse_matrix,
+   read_info,
 )
 
 global K # Number of units / set by user.
@@ -35,8 +25,6 @@ DEBUG = False
 SUBSMPL = 512
 NUM_PARTICLES = 12
 NUM_EPOCHS = 16
-
-DEBUG_COUNTER = 0
 
 # Use only for debugging.
 pyro.enable_validation(DEBUG)
@@ -185,7 +173,7 @@ class Stadacone(pyro.nn.PyroModule):
      
       # 2) Define the autoguide.
       self.autonormal = AutoNormal(pyro.poutine.block(
-         self.model, hide = ["cell_type_unobserved", "logits_i"]
+         self.model, hide = ["cell_type_unobserved", "z_i"]
       ))
 
       # 3) Define the guide parameters.
@@ -195,11 +183,11 @@ class Stadacone(pyro.nn.PyroModule):
          event_dim = 1
       )
       if self.marginalize is False:
-         self.logits_i_loc = pyro.nn.module.PyroParam(
+         self.z_i_loc = pyro.nn.module.PyroParam(
             torch.zeros(self.ncells,G).to(self.device),
             event_dim = 0
          )
-         self.logits_i_scale = pyro.nn.module.PyroParam(
+         self.z_i_scale = pyro.nn.module.PyroParam(
             torch.ones(self.ncells,G).to(self.device),
             constraint = torch.distributions.constraints.positive,
             event_dim = 0
@@ -382,7 +370,7 @@ class Stadacone(pyro.nn.PyroModule):
       units_i = torch.einsum("...noK,...GKR,nR->...nG", theta_i, units, ohg)
       return units_i
 
-   def compute_ELBO_logits_i(self, x_ij, mu, sg, x_ij_mask, idx):
+   def compute_ELBO_z_i(self, x_ij, mu, sg, x_ij_mask, idx):
       # Parameters `mu` and `sg` are the prior parameters of the Poisson
       # LogNormal distribution. The variational posterior parameters
       # given the observations `x_ij` are `xi` and `w2_i`. In this case
@@ -623,16 +611,16 @@ class Stadacone(pyro.nn.PyroModule):
          gene_fuzz = gene_fuzz.transpose(-1,-2)
 
          if self.marginalize:
-            x_ij = self.compute_ELBO_logits_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
+            x_ij = self.compute_ELBO_z_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
             return
 
          else:
             # Per-cell, per-gene sampling.
             with pyro.plate("ncellsxG", G, dim=-1):
 
-               logits_i = pyro.sample(
-                  name = "logits_i",
-                  # dim(logits_i): ncells x G
+               z_i = pyro.sample(
+                  name = "z_i",
+                  # dim(z_i): ncells x G
                   fn = dist.Normal(
                      torch.zeros(1,1).to(self.device),
                      gene_fuzz,
@@ -652,9 +640,9 @@ class Stadacone(pyro.nn.PyroModule):
             else:
                # Auto-shift.
                shift_i = x_i.sum(dim=-1, keepdim=True).log() - \
-                  torch.logsumexp(logits_i + base_i + log_probs, dim=(-1,-4), keepdim=True)
+                  torch.logsumexp(z_i + base_i + log_probs, dim=(-1,-4), keepdim=True)
 
-            rate_i = torch.clamp(torch.exp(logits_i + base_i + shift_i), max=1e6)
+            rate_i = torch.clamp(torch.exp(z_i + base_i + shift_i), max=1e6)
 
             x = pyro.sample(
                name = "x_i",
@@ -697,22 +685,22 @@ class Stadacone(pyro.nn.PyroModule):
                   infer={ "enumerate": "parallel" },
             )
 
-         # If `logits_i` are not marginalized, sample it.
+         # If `z_i` are not marginalized, sample it.
          if self.marginalize is False:
 
-            logits_i_loc = self.logits_i_loc
-            logits_i_scale = self.logits_i_scale
+            z_i_loc = self.z_i_loc
+            z_i_scale = self.z_i_scale
 
             # Per-cell, per-gene sampling.
             with pyro.plate("ncellsxG", G, dim=-1):
 
-               # Posterior distribution of `logits_i`.
-               post_logits_i = pyro.sample(
-                     name = "logits_i",
-                     # dim(logits_i): n x G
+               # Posterior distribution of `z_i`.
+               post_z_i = pyro.sample(
+                     name = "z_i",
+                     # dim(z_i): n x G
                      fn = dist.Normal(
-                        logits_i_loc,
-                        logits_i_scale,
+                        z_i_loc,
+                        z_i_scale,
                      ),
                )
 
@@ -797,7 +785,6 @@ if __name__ == "__main__":
       default_root_dir = ".",
       strategy = pl.strategies.DeepSpeedStrategy(stage=2),
       accelerator = "gpu",
-      devices = [0],
       gradient_clip_val = 1.0,
       max_epochs = NUM_EPOCHS,
       enable_progress_bar = True,
