@@ -145,32 +145,32 @@ class Stadacone(pyro.nn.PyroModule):
          self.need_to_infer_units = True
          self.output_units = self.sample_units
          self.output_theta_i = self.sample_theta_i
-         self.output_units_i = self.compute_units_i
+         self.collect_units_i = self.compute_units_i
       else:
          self.need_to_infer_units = False
          self.output_units = self.zero
          self.output_theta_i = self.zero
-         self.output_units_i = self.zero
+         self.collect_units_i = self.zero
 
       if B > 1:
          self.need_to_infer_batch_fx = True
          self.output_batch_fx_scale = self.sample_batch_fx_scale
          self.output_batch_fx = self.sample_batch_fx
-         self.output_batch_fx_i = self.compute_batch_fx_i
+         self.collect_batch_fx_i = self.compute_batch_fx_i
       else:
          self.need_to_infer_batch_fx = False
          self.output_batch_fx_scale = self.zero
          self.output_batch_fx = self.zero
-         self.output_batch_fx_i = self.zero
+         self.collect_batch_fx_i = self.zero
 
       if cmask.all():
          self.need_to_infer_cell_type = False
          self.output_c_indx = self.return_ctype_as_is
-         self.output_base_i = self.compute_base_i_no_enum
+         self.collect_base_i = self.compute_base_i_no_enum
       else:
          self.need_to_infer_cell_type = True
          self.output_c_indx = self.sample_c_indx
-         self.output_base_i = self.compute_base_i_enum
+         self.collect_base_i = self.compute_base_i_enum
      
       # 2) Define the autoguide.
       self.autonormal = AutoNormal(pyro.poutine.block(
@@ -565,6 +565,9 @@ class Stadacone(pyro.nn.PyroModule):
       
          # dim(fuzz): (P) x G x 1
          gene_fuzz = self.output_gene_fuzz(log_fuzz_loc, log_fuzz_scale)
+
+         # dim(fuzz): (P) x 1 x G
+         gene_fuzz = gene_fuzz.transpose(-1,-2)
    
          # Per-batch, per-gene sampling.
          with pyro.plate("GxB", B, dim=-1):
@@ -579,7 +582,10 @@ class Stadacone(pyro.nn.PyroModule):
          # Per-unit, per-type, per-gene sampling.
          with pyro.plate("GxKR", K*R, dim=-1):
 
-            # TODO: describe prior.
+            # Unit effects have a Gaussian distribution
+            # centered on 0. They have a 90% chance of
+            # lying in the interval (-1.15, 1.15), which
+            # corresponds to 3-fold effects.
 
             # dim(units): (P) x G x K x R
             units = self.output_units()
@@ -598,29 +604,29 @@ class Stadacone(pyro.nn.PyroModule):
          # Cell types as discrete indicators. The prior
          # distiribution is uniform over known cell types.
 
-         # dim(c_indx): C x (P) x ncells x 1 | C  /// (P) x ncells x 1 | C
+         # dim(c_indx): C x (P) x ncells x 1
          c_indx = self.output_c_indx(ctype_i, ctype_i_mask)
 
-         # Proportion of the units in the transcriptomes.
-         # TODO: describe prior.
+         # Proportion of each unit in transcriptomes.
+         # The proportions are computed from the softmax
+         # of K standard Gaussian variables. This means
+         # that there is a 90% chance that two proportions
+         # are within a factor 10 of each other.
 
-         # dim(theta_i): (P) x ncells x 1 x K  ///  *
+         # dim(theta_i): (P) x ncells x 1 x K
          theta_i = self.output_theta_i()
    
 
-         # Deterministic functions to obtain per-cell means.
+         # Deterministic functions to collect per-cell means.
 
-         # dim(base_i): C x (P) x ncells x G  ///  (P) x ncells x G
-         base_i = self.output_base_i(c_indx, base)
+         # dim(base_i): C x (P) x ncells x G
+         base_i = self.collect_base_i(c_indx, base)
    
          # dim(batch_fx_i): (P) x ncells x G
-         batch_fx_i = self.output_batch_fx_i(batch, batch_fx, indx_i, base.dtype)
+         batch_fx_i = self.collect_batch_fx_i(batch, batch_fx, indx_i, base.dtype)
    
          # dim(units_i): (P) x ncells x G
-         units_i = self.output_units_i(group, theta_i, units, indx_i)
-
-         # dim(fuzz): (P) x 1 x G
-         gene_fuzz = gene_fuzz.transpose(-1,-2)
+         units_i = self.collect_units_i(group, theta_i, units, indx_i)
 
          if self.marginalize:
             x_ij = self.compute_ELBO_z_i(x_i, base_i, gene_fuzz, x_i_mask, indx_i)
