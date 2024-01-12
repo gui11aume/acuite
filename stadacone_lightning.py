@@ -124,9 +124,10 @@ class Stadacone(pyro.nn.PyroModule):
       self.bsz = self.ncells if self.ncells < SUBSMPL else SUBSMPL
 
       # Format observed labels. Create one-hot encoding with label smoothing.
-      # TODO: clean unit labels.
-      oh = F.one_hot(self.label, num_classes=K).to(self.X.dtype)
-      self.smooth_lab = ((.99-.01/(K-1)) * oh + .01/(K-1)).view(-1,1,K) if K > 1 else 0.
+      # TODO: allow unit labels.
+#      oh = F.one_hot(self.label, num_classes=K).to(self.X.dtype)
+#      self.smooth_lab = ((.99-.01/(K-1)) * oh + .01/(K-1)).view(-1,1,K) if K > 1 else 0.
+      self.smooth_lab = None
 
       self.marginalize = marginalize
 
@@ -173,15 +174,28 @@ class Stadacone(pyro.nn.PyroModule):
      
       # 2) Define the autoguide.
       self.autonormal = AutoNormal(pyro.poutine.block(
-         self.model, hide = ["cell_type_unobserved", "z_i"]
+         self.model, hide = ["log_theta_i", "cell_type_unobserved", "z_i"]
       ))
 
       # 3) Define the guide parameters.
-      self.c_indx_probs = pyro.nn.module.PyroParam(
-         torch.ones(self.ncells,1,C).to(self.device),
-         constraint = torch.distributions.constraints.simplex,
-         event_dim = 1
-      )
+      if self.need_to_infer_cell_type:
+         self.c_indx_probs = pyro.nn.module.PyroParam(
+            torch.ones(self.ncells,1,C).to(self.device),
+            constraint = torch.distributions.constraints.simplex,
+            event_dim = 1
+         )
+
+      if self.need_to_infer_units:
+         self.log_theta_i_loc = pyro.nn.module.PyroParam(
+            torch.zeros(self.ncells,1,K).to(self.device),
+            event_dim = 1
+         )
+         self.log_theta_i_scale = pyro.nn.module.PyroParam(
+            torch.ones(self.ncells,1,K).to(self.device),
+            constraint = torch.distributions.constraints.positive,
+            event_dim = 1
+         )
+
       if self.marginalize is False:
          self.z_i_loc = pyro.nn.module.PyroParam(
             torch.zeros(self.ncells,G).to(self.device),
@@ -327,7 +341,7 @@ class Stadacone(pyro.nn.PyroModule):
    def return_ctype_as_is(self, ctype_i, cmask_i_mask):
       return ctype_i
 
-   def sample_theta_i(self, lab, lmask, indx_i):
+   def sample_theta_i(self):
       log_theta_i = pyro.sample(
             name = "log_theta_i",
             # dim(log_theta_i): (P) x ncells x 1 | K
@@ -335,8 +349,6 @@ class Stadacone(pyro.nn.PyroModule):
                torch.zeros(1,1,K).to(self.device),
                torch.ones(1,1,K).to(self.device)
             ).to_event(1),
-            obs = subset(self.smooth_lab, indx_i),
-            obs_mask = subset(lmask, indx_i)
       ) 
       # dim(theta_i): (P) x ncells x 1 x K
       theta_i = log_theta_i.softmax(dim=-1)
@@ -593,7 +605,7 @@ class Stadacone(pyro.nn.PyroModule):
          # TODO: describe prior.
 
          # dim(theta_i): (P) x ncells x 1 x K  ///  *
-         theta_i = self.output_theta_i(self.smooth_lab, self.lmask, indx_i)
+         theta_i = self.output_theta_i()
    
 
          # Deterministic functions to obtain per-cell means.
@@ -672,24 +684,36 @@ class Stadacone(pyro.nn.PyroModule):
          # TODO: find canonical way to enter context of the module.
          self._pyro_context.active += 1
 
-         c_indx_probs = self.c_indx_probs
-      
-         with pyro.poutine.mask(mask=~ctype_i_mask):
 
-            c_indx = pyro.sample(
-                  name = "cell_type_unobserved",
-                  # dim(c_indx): C x 1 x 1 x 1 | C
-                  fn = dist.OneHotCategorical(
-                     c_indx_probs # dim: ncells x 1 | C
-                  ),
-                  infer={ "enumerate": "parallel" },
+         # If more than one unit, sample them here.
+         if self.need_to_infer_units:
+
+            # Posterior distribution of `log_theta_i`.
+            post_log_theta_i = pyro.sample(
+                  name = "log_theta_i",
+                  # dim(log_theta_i): (P) x ncells x 1 | K
+                  fn = dist.Normal(
+                     self.log_theta_i_loc,
+                     self.log_theta_i_scale,
+                  ).to_event(1),
             )
 
-         # If `z_i` are not marginalized, sample it.
-         if self.marginalize is False:
+         # If some cell types are unknown, sample them here.
+         if self.need_to_infer_cell_type:
 
-            z_i_loc = self.z_i_loc
-            z_i_scale = self.z_i_scale
+            with pyro.poutine.mask(mask=~ctype_i_mask):
+   
+               c_indx = pyro.sample(
+                     name = "cell_type_unobserved",
+                     # dim(c_indx): C x 1 x 1 x 1 | C
+                     fn = dist.OneHotCategorical(
+                        self.c_indx_probs # dim: ncells x 1 | C
+                     ),
+                     infer={ "enumerate": "parallel" },
+               )
+
+         # If `z_i` are not marginalized, sample them here.
+         if self.marginalize is False:
 
             # Per-cell, per-gene sampling.
             with pyro.plate("ncellsxG", G, dim=-1):
@@ -699,8 +723,8 @@ class Stadacone(pyro.nn.PyroModule):
                      name = "z_i",
                      # dim(z_i): n x G
                      fn = dist.Normal(
-                        z_i_loc,
-                        z_i_scale,
+                        self.z_i_loc,
+                        self.z_i_scale,
                      ),
                )
 
