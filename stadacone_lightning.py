@@ -240,9 +240,9 @@ class Stadacone(pyro.nn.PyroModule):
    def sample_batch_fx_scale(self):
       batch_fx_scale = pyro.sample(
             name = "batch_fx_scale",
-            # dim(base): (P x 1) x B
+            # dim(base): (P) x 1 x B
             fn = dist.Exponential(
-               5. * torch.ones(1).to(self.device),
+               5. * torch.ones(1,1).to(self.device),
             ),
       )
       return batch_fx_scale
@@ -495,7 +495,7 @@ class Stadacone(pyro.nn.PyroModule):
          # is applied to all the genes so it describes how far
          # the batch is from the prototype transcriptome.
 
-         # dim(batch_fx_scale): (P x 1) x B
+         # dim(batch_fx_scale): (P) x 1 x B
          batch_fx_scale = self.output_batch_fx_scale()
 
 
@@ -779,8 +779,8 @@ if __name__ == "__main__":
    G = int(X.shape[-1])
 
    # XXX #
-   B = 1 # <=== remove batches
-   batch = torch.zeros_like(batch)
+#   B = 1 # <=== remove batches
+#   batch = torch.zeros_like(batch)
 #   batch = torch.zeros_like(batch[idx])
 #   ctype = ctype[idx]
 #   group = group[idx]
